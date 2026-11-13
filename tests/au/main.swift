@@ -39,7 +39,13 @@ func makeHost() throws -> (AVAudioEngine, AVAudioUnit) {
         instantiateError = error
         semaphore.signal()
     }
-    semaphore.wait()
+    // Pump the main run loop while waiting: the completion is delivered on the
+    // main queue, so blocking the main thread on the semaphore would deadlock.
+    let deadline = Date().addingTimeInterval(30)
+    while semaphore.wait(timeout: .now()) != .success {
+        if Date() > deadline { throw NSError(domain: "test", code: 2, userInfo: [NSLocalizedDescriptionKey: "instantiate timed out"]) }
+        RunLoop.main.run(until: Date().addingTimeInterval(0.01))
+    }
     if let instantiateError { throw instantiateError }
     guard let unit = instrument else {
         throw NSError(domain: "test", code: 1,

@@ -24,8 +24,10 @@ swiftc -O -parse-as-library \
     -Xlinker -application_extension \
     -Xlinker -e -Xlinker _NSExtensionMain \
     -framework AudioToolbox -framework AVFAudio -framework Foundation \
+    -framework SwiftUI -framework AppKit -framework Combine -framework CoreAudioKit \
     -lc++ \
-    "$ROOT/plugin/SynthAudioUnit.swift" "$BUILD/synth_core.o" \
+    "$ROOT/plugin/SynthAudioUnit.swift" "$ROOT/plugin/SynthViewController.swift" \
+    "$ROOT/ui/SynthUI.swift" "$BUILD/synth_core.o" \
     -o "$APPEX/Contents/MacOS/SynthExtension"
 
 echo "==> Host app (SwiftUI window, loads the AU in-process)"
@@ -34,15 +36,19 @@ cp "$ROOT/host/Info.plist" "$APP/Contents/Info.plist"
 swiftc -O -parse-as-library \
     -module-name SynthHost \
     -import-objc-header "$ROOT/plugin/Bridging-Header.h" \
-    "$ROOT/host/SynthHostApp.swift" "$ROOT/plugin/SynthAudioUnit.swift" "$BUILD/synth_core.o" \
+    "$ROOT/host/SynthHostApp.swift" "$ROOT/ui/SynthUI.swift" "$ROOT/plugin/SynthAudioUnit.swift" "$BUILD/synth_core.o" \
     -lc++ \
     -framework SwiftUI -framework AppKit -framework AudioToolbox \
     -framework AVFAudio -framework Foundation -framework Combine \
     -o "$APP/Contents/MacOS/SynthHost"
 
-echo "==> Ad-hoc code signing"
+echo "==> Embedding the AU extension in the containing app (AUv3 layout)"
+mkdir -p "$APP/Contents/PlugIns"
+cp -R "$APPEX" "$APP/Contents/PlugIns/"
+
+echo "==> Ad-hoc code signing (extension first, then the containing app)"
 codesign --force --sign - --timestamp=none \
-    --entitlements "$ROOT/plugin/Extension.entitlements" "$APPEX"
+    --entitlements "$ROOT/plugin/Extension.entitlements" "$APP/Contents/PlugIns/SynthExtension.appex"
 # Host is unsandboxed: a sandboxed host cannot load the AU in-process (-3000).
 codesign --force --sign - --timestamp=none "$APP"
 codesign --verify --deep --strict "$APP"

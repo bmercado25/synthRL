@@ -260,6 +260,23 @@ struct Reverb {
     }
 };
 
+// One sounding note: its own oscillators, filter and envelopes. Voices are
+// summed, then drive and reverb are applied to the mix.
+struct Voice {
+    int note = -1;
+    double baseHz = 0.0;
+    double velocityGain = 0.0;
+    bool held = false;               // key is still down (not yet released)
+    unsigned long long order = 0;    // start order, used to steal the oldest voice
+    Oscillator oscA;
+    Oscillator oscB;
+    SvfLowpass filter;
+    Envelope ampEnv;
+    Envelope filterEnv;
+
+    bool sounding() const { return ampEnv.stage != kEnvIdle; }
+};
+
 }  // namespace
 
 float synth_cutoff_hz(float normalized) {
@@ -281,17 +298,13 @@ float synth_lfo_hz(float normalized) {
 }
 
 struct SynthCore {
+    static const int kMaxVoices = 8;
+
     double sampleRate = 44100.0;
-    double baseHz = 0.0;       // frequency of the held note, before detune and LFO (0 = silent)
-    Oscillator oscA;
-    Oscillator oscB;
-    SvfLowpass filter;
-    Envelope ampEnv;
-    Envelope filterEnv;
-    double velocityGain = 0.0;
+    Voice voices[kMaxVoices];
+    unsigned long long nextOrder = 1;
     double lfoPhase = 0.0;     // cycles, [0,1)
     Reverb reverb;
-    int activeNote = -1;
 
     // Written by the UI thread, read by the render thread.
     std::atomic<float> params[SYNTH_PARAM_COUNT];
@@ -365,24 +378,47 @@ void synth_note_on(SynthCore* core, int note, int velocity) {
         synth_note_off(core, note);
         return;
     }
-    core->activeNote = note;
-    core->baseHz = 440.0 * std::pow(2.0, (note - 69) / 12.0);
-    // Start each note at the same oscillator phase, so a patch always sounds
-    // the same when played the same way (needed for deterministic renders).
-    core->oscA.phase = 0.0;
-    core->oscB.phase = 0.0;
-    core->velocityGain = kMasterAmplitude * (velocity / 127.0);
-    core->ampEnv.noteOn();
-    core->filterEnv.noteOn();
+    // Pick a voice: an idle one first, then the oldest released one, then the
+    // oldest one overall (stealing).
+    Voice* chosen = nullptr;
+    for (auto& v : core->voices) {
+        if (!v.sounding()) { chosen = &v; break; }
+    }
+    if (!chosen) {
+        for (auto& v : core->voices) {
+            if (!v.held && (!chosen || v.order < chosen->order)) chosen = &v;
+        }
+    }
+    if (!chosen) {
+        for (auto& v : core->voices) {
+            if (!chosen || v.order < chosen->order) chosen = &v;
+        }
+    }
+
+    chosen->note = note;
+    chosen->held = true;
+    chosen->order = core->nextOrder++;
+    chosen->baseHz = 440.0 * std::pow(2.0, (note - 69) / 12.0);
+    // Start each note at the same oscillator phase and filter state, so a patch
+    // always sounds the same when played the same way (needed for deterministic renders).
+    chosen->oscA.phase = 0.0;
+    chosen->oscB.phase = 0.0;
+    chosen->filter = SvfLowpass();
+    chosen->velocityGain = kMasterAmplitude * (velocity / 127.0);
+    chosen->ampEnv.noteOn();
+    chosen->filterEnv.noteOn();
 }
 
 void synth_note_off(SynthCore* core, int note) {
-    if (note != core->activeNote) {
-        return;
+    // Release the oldest held voice playing this note.
+    Voice* target = nullptr;
+    for (auto& v : core->voices) {
+        if (v.held && v.note == note && (!target || v.order < target->order)) target = &v;
     }
-    core->activeNote = -1;
-    core->ampEnv.noteOff();
-    core->filterEnv.noteOff();
+    if (!target) return;
+    target->held = false;
+    target->ampEnv.noteOff();
+    target->filterEnv.noteOff();
 }
 
 void synth_render(SynthCore* core, float* out, int frames) {
@@ -425,38 +461,41 @@ void synth_render(SynthCore* core, float* out, int frames) {
     const double fltRelease = env_step(static_cast<float>(load(SYNTH_PARAM_FILTER_ENV_RELEASE)), sr);
     const double fltSustain = load(SYNTH_PARAM_FILTER_ENV_SUSTAIN);
 
-    const double baseCps = core->baseHz / sr;
-
     for (int i = 0; i < frames; ++i) {
-        // LFO: sine, free running.
+        // LFO: sine, free running. Shared by all voices.
         const double lfo = std::sin(kTwoPi * core->lfoPhase);
         core->lfoPhase += lfoInc;
         if (core->lfoPhase >= 1.0) core->lfoPhase -= 1.0;
 
-        core->ampEnv.tick(ampAttack, ampDecay, ampRelease, ampSustain);
-        core->filterEnv.tick(fltAttack, fltDecay, fltRelease, fltSustain);
+        // Sum the sounding voices. Each one: oscillators, then its own filter, then its amp.
+        double mixed = 0.0;
+        for (auto& v : core->voices) {
+            if (!v.sounding()) continue;
+            v.ampEnv.tick(ampAttack, ampDecay, ampRelease, ampSustain);
+            v.filterEnv.tick(fltAttack, fltDecay, fltRelease, fltSustain);
 
-        // Pitch: detune plus LFO vibrato. Cents -> frequency ratio is 2^(c/1200).
-        const double cpsA = baseCps * std::exp2((detuneA + lfoPitchCents * lfo) / 1200.0);
-        const double cpsB = baseCps * std::exp2((detuneB + lfoPitchCents * lfo) / 1200.0);
+            const double baseCps = v.baseHz / sr;
+            // Pitch: detune plus LFO vibrato. Cents -> frequency ratio is 2^(c/1200).
+            const double cpsA = baseCps * std::exp2((detuneA + lfoPitchCents * lfo) / 1200.0);
+            const double cpsB = baseCps * std::exp2((detuneB + lfoPitchCents * lfo) / 1200.0);
+            const double raw = levelA * v.oscA.next(waveA, cpsA) +
+                               levelB * v.oscB.next(waveB, cpsB);
 
-        // Mixer: each oscillator scaled by its level, then summed.
-        const double mixed = levelA * core->oscA.next(waveA, cpsA) +
-                             levelB * core->oscB.next(waveB, cpsB);
+            // Filter: base cutoff, opened by this voice's envelope and moved by the LFO.
+            double cutoff = baseCutoffHz *
+                            std::exp2(filterEnvOctaves * v.filterEnv.level + lfoFilterOctaves * lfo);
+            cutoff = std::fmin(std::fmax(cutoff, kMinCutoffHz), 0.45 * sr);
+            const double g = std::tan(kPi * cutoff / sr);
+            const double filtered = v.filter.process(raw, g, k);
 
-        // Drive: soft clip, normalized so the peak stays near full scale.
+            mixed += v.velocityGain * v.ampEnv.level * filtered;
+        }
+
+        // Drive: soft clip on the mix, normalized so the peak stays near full scale.
         const double shaped = drive > 0.0 ? std::tanh(mixed * driveGain) / driveNorm : mixed;
 
-        // Filter: base cutoff, opened by the filter envelope and moved by the LFO.
-        double cutoff = baseCutoffHz *
-                        std::exp2(filterEnvOctaves * core->filterEnv.level + lfoFilterOctaves * lfo);
-        cutoff = std::fmin(std::fmax(cutoff, kMinCutoffHz), 0.45 * sr);
-        const double g = std::tan(kPi * cutoff / sr);
-        const double filtered = core->filter.process(shaped, g, k);
-
-        // Amp envelope and velocity, then reverb after the envelope so the tail rings out.
-        const double dry = core->velocityGain * core->ampEnv.level * filtered;
-        const double wet = core->reverb.processWet(dry, reverbFeedback);
-        out[i] = static_cast<float>(dry * (1.0 - reverbMix) + wet * reverbMix);
+        // Reverb after the mix so the tail rings out after the notes end.
+        const double wet = core->reverb.processWet(shaped, reverbFeedback);
+        out[i] = static_cast<float>(shaped * (1.0 - reverbMix) + wet * reverbMix);
     }
 }

@@ -24,4 +24,11 @@ swiftc -O -module-name AUTest \
     plugin/SynthAudioUnit.swift tests/au/main.swift build/synth_core.o \
     -lc++ -framework AudioToolbox -framework AVFAudio -framework Foundation \
     -o build/au_test
+# The installed copy in ~/Applications is registered with the system, which makes
+# the in-process test try to launch it out of process (4097). Ignore it for the
+# duration of the test, then restore it.
+if pluginkit -m -i com.synthrl.host.synth >/dev/null 2>&1; then
+    pluginkit -e ignore -i com.synthrl.host.synth || true
+    trap 'pluginkit -e use -i com.synthrl.host.synth || true' EXIT
+fi
 ./build/au_test build/au_output.wav

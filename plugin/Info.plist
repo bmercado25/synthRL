@@ -32,11 +32,11 @@
 			<array>
 				<dict>
 					<key>description</key>
-					<string>Monophonic sine test synth</string>
+					<string>Subtractive synth: two oscillators, filter, envelopes, LFO, drive and reverb</string>
 					<key>manufacturer</key>
 					<string>SyRR</string>
 					<key>name</key>
-					<string>SynthRL: Rudimentary Sine</string>
+					<string>SynthRL</string>
 					<key>sandboxSafe</key>
 					<true/>
 					<key>subtype</key>
@@ -53,9 +53,9 @@
 			</array>
 		</dict>
 		<key>NSExtensionPointIdentifier</key>
-		<string>com.apple.AudioUnit</string>
+		<string>com.apple.AudioUnit-UI</string>
 		<key>NSExtensionPrincipalClass</key>
-		<string>SynthAudioUnit</string>
+		<string>SynthAudioUnitViewController</string>
 	</dict>
 </dict>
 </plist>

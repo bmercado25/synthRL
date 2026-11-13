@@ -412,6 +412,61 @@ int main() {
         synth_destroy(s);
     }
 
+    std::printf("Chords: several notes sound at once\n");
+    {
+        SynthCore* one = synth_create(kSR);
+        synth_note_on(one, 60, 100);
+        std::vector<float> single(kSecond / 2);
+        synth_render(one, single.data(), kSecond / 2);
+        synth_destroy(one);
+
+        SynthCore* chord = synth_create(kSR);
+        synth_note_on(chord, 60, 100);
+        synth_note_on(chord, 64, 100);
+        synth_note_on(chord, 67, 100);
+        std::vector<float> triad(kSecond / 2);
+        synth_render(chord, triad.data(), kSecond / 2);
+        CHECK(rms(triad) > rms(single) * 1.2, "a triad is louder than one note");
+
+        // Release the root: the other two keep sounding.
+        synth_note_off(chord, 60);
+        std::vector<float> rest(kSecond / 2);
+        synth_render(chord, rest.data(), kSecond / 2);
+        CHECK(peak(rest) > 0.05, "releasing one chord note keeps the others sounding");
+
+        synth_note_off(chord, 64);
+        synth_note_off(chord, 67);
+        synth_render(chord, rest.data(), kSecond / 2);  // let the release finish
+        std::vector<float> after(4800);
+        synth_render(chord, after.data(), 4800);
+        CHECK(peak(after) == 0.0, "silent once every chord note is released");
+        synth_destroy(chord);
+    }
+
+    std::printf("Chords: a repeated note releases one voice at a time\n");
+    {
+        SynthCore* s = synth_create(kSR);
+        synth_note_on(s, 69, 100);
+        synth_note_on(s, 69, 100);
+        synth_note_off(s, 69);
+        std::vector<float> out(kSecond / 2);
+        synth_render(s, out.data(), kSecond / 2);
+        CHECK(peak(out) > 0.05, "one of two held A4s still sounds");
+        synth_destroy(s);
+    }
+
+    std::printf("Chords: more notes than voices steal without failing\n");
+    {
+        SynthCore* s = synth_create(kSR);
+        for (int n = 40; n < 52; ++n) synth_note_on(s, n, 100);  // 12 notes, 8 voices
+        std::vector<float> out(kSecond / 4);
+        synth_render(s, out.data(), kSecond / 4);
+        bool finite = true;
+        for (float x : out) if (!std::isfinite(x)) finite = false;
+        CHECK(finite && peak(out) > 0.05, "12 held notes render finite, audible output");
+        synth_destroy(s);
+    }
+
     std::printf("Deterministic: same input gives identical output\n");
     {
         std::vector<float> a(kSecond), b(kSecond);
