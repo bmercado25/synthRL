@@ -146,6 +146,58 @@ do {
     let again = try render(engine2, seconds: 1.0)
     check(again == tone, "bit-identical to the first run")
 
+    print("Parameter tree exposes the schema")
+    let tree = unit.auAudioUnit.parameterTree!
+    let expected: [(AUParameterAddress, String)] = [
+        (0, "oscA_wave"), (1, "oscA_level"), (2, "oscB_wave"), (3, "oscB_level"),
+        (4, "filter_cutoff"), (5, "filter_resonance"),
+        (6, "env_attack"), (7, "env_decay"), (8, "env_sustain"), (9, "env_release"),
+    ]
+    for (address, identifier) in expected {
+        check(tree.parameter(withAddress: address)?.identifier == identifier,
+              "address \(address) is \(identifier)")
+    }
+    let waveParam = tree.parameter(withAddress: 0)!
+    check(waveParam.valueStrings?.count == 4, "waveform offers 4 choices")
+    check(waveParam.valueStrings?.last == "Triangle", "last waveform is Triangle")
+
+    print("Parameter changes reach the audio")
+    // Each scenario uses a fresh host so earlier settings do not leak in.
+    func rendered(_ setup: (AUParameterTree) -> Void) throws -> [Float] {
+        let (engine, host) = try makeHost()
+        setup(host.auAudioUnit.parameterTree!)
+        _ = sendMIDI(host, 0x90, 69, 127)
+        return try render(engine, seconds: 1.0)[0]
+    }
+    func rms(_ x: [Float]) -> Double {
+        sqrt(x.reduce(0.0) { $0 + Double($1) * Double($1) } / Double(x.count))
+    }
+
+    let defaultOut = try rendered { _ in }
+    check(abs(rms(defaultOut) - 0.5 / 2.0.squareRoot()) < 0.01, "default is a sine (RMS 0.354)")
+
+    let squareOut = try rendered { $0.parameter(withAddress: 0)?.value = 2 }
+    check(abs(rms(squareOut) - 0.5) < 0.01, "osc A set to Square (RMS 0.5)")
+
+    let silentOut = try rendered { $0.parameter(withAddress: 1)?.value = 0 }
+    check(peak(silentOut) == 0, "osc A level 0 is silent")
+
+    let bOut = try rendered {
+        $0.parameter(withAddress: 1)?.value = 0
+        $0.parameter(withAddress: 2)?.value = 2
+        $0.parameter(withAddress: 3)?.value = 1
+    }
+    check(abs(rms(bOut) - 0.5) < 0.01, "osc B alone set to Square and level 1")
+
+    // Cutoff normalized 0.2 is about 80 Hz, well below A4 (440 Hz).
+    let closedOut = try rendered { $0.parameter(withAddress: 4)?.value = 0.2 }
+    check(rms(closedOut) < rms(defaultOut) * 0.2, "closing the filter cuts A4 hard")
+
+    // Attack about 500 ms: the first 10 ms should be far quieter than the default.
+    let slowAttackOut = try rendered { $0.parameter(withAddress: 6)?.value = 0.675 }
+    let earlySlice = Array(slowAttackOut[0..<480])
+    check(rms(earlySlice) < rms(defaultOut) * 0.2, "a slow attack fades the note in")
+
     let out = CommandLine.arguments.count > 1 ? CommandLine.arguments[1] : "build/au_output.wav"
     try writeWAV(tone, to: out)
     print("  wrote \(out)")

@@ -40,6 +40,10 @@ final class AudioHost: ObservableObject {
     @Published var status = "Starting audio…"
     @Published var activeNote: Int?
     @Published var velocity: Double = 100
+    /// Parameter values, indexed by the core's parameter index (its AU address).
+    @Published var params: [Float] = (0..<Int(synth_param_count())).map {
+        synth_param_info(Int32($0)).defaultValue
+    }
 
     let scope = ScopeBuffer()
     private let engine = AVAudioEngine()
@@ -67,6 +71,13 @@ final class AudioHost: ObservableObject {
                 scope.update(Array(UnsafeBufferPointer(start: data[0], count: n)))
             }
 
+            // Push the UI's values into the unit before audio starts.
+            if let tree = unit.auAudioUnit.parameterTree {
+                for (index, value) in params.enumerated() {
+                    tree.parameter(withAddress: AUParameterAddress(index))?.value = value
+                }
+            }
+
             try engine.start()
             self.unit = unit
             let rate = engine.outputNode.outputFormat(forBus: 0).sampleRate
@@ -77,6 +88,14 @@ final class AudioHost: ObservableObject {
             NSLog("SynthRL audio start failed: domain=%@ code=%d %@", e.domain, e.code, "\(e)")
             status = "Audio error: \(e.localizedDescription) (code \(e.code))"
         }
+    }
+
+    /// Sets a parameter on the unit (through its parameter tree) and mirrors it in the UI.
+    func setParam(_ index: Int, _ value: Float) {
+        params[index] = value
+        unit?.auAudioUnit.parameterTree?
+            .parameter(withAddress: AUParameterAddress(index))?
+            .value = value
     }
 
     func noteOn(_ note: Int) {
@@ -192,13 +211,107 @@ struct KeyboardView: View {
     }
 }
 
+/// Rotary knob for a normalized (0-1) value. Drag up or down to turn it.
+struct KnobView: View {
+    let title: String
+    @Binding var value: Double
+    let valueText: String
+
+    @State private var dragStart: Double?
+    private let size: CGFloat = 64
+    // Knob sweep: 270 degrees, from 7:30 (min) to 4:30 (max).
+    private let sweep: Double = 270
+
+    var body: some View {
+        VStack(spacing: 6) {
+            ZStack {
+                Circle()
+                    .trim(from: 0, to: 0.75)
+                    .stroke(Color.gray.opacity(0.3), style: StrokeStyle(lineWidth: 6, lineCap: .round))
+                    .rotationEffect(.degrees(135))
+                Circle()
+                    .trim(from: 0, to: 0.75 * value)
+                    .stroke(Color.accentColor, style: StrokeStyle(lineWidth: 6, lineCap: .round))
+                    .rotationEffect(.degrees(135))
+                Capsule()
+                    .fill(Color.primary)
+                    .frame(width: 3, height: size * 0.36)
+                    .offset(y: -size * 0.14)
+                    .rotationEffect(.degrees(-135 + sweep * value))
+            }
+            .frame(width: size, height: size)
+            .contentShape(Circle())
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { g in
+                        if dragStart == nil { dragStart = value }
+                        // 200 points of vertical drag sweeps the whole range.
+                        let v = (dragStart ?? value) - Double(g.translation.height) / 200
+                        value = min(1, max(0, v))
+                    }
+                    .onEnded { _ in dragStart = nil }
+            )
+
+            Text(title).font(.caption.bold())
+            Text(valueText).font(.caption.monospaced()).foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity)
+    }
+}
+
 struct ContentView: View {
     @ObservedObject var host: AudioHost
+
+    private var waveNames: [String] {
+        (0..<Int(synth_waveform_count())).map { String(cString: synth_waveform_name(Int32($0))) }
+    }
+
+    /// Two-way binding from a parameter index to a slider or picker.
+    private func binding(_ index: Int) -> Binding<Double> {
+        Binding(
+            get: { Double(host.params[index]) },
+            set: { host.setParam(index, Float($0)) })
+    }
+
+    private func oscillator(_ title: String, wave: Int) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(title).font(.headline)
+            Picker("Waveform", selection: binding(wave)) {
+                ForEach(Array(waveNames.enumerated()), id: \.offset) { i, name in
+                    Text(name).tag(Double(i))
+                }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    /// Shows an envelope time in ms (under 1 s) or seconds.
+    private func timeText(_ index: Int) -> String {
+        let secs = synth_envelope_seconds(host.params[index])
+        return secs < 1 ? String(format: "%.0f ms", secs * 1000) : String(format: "%.2f s", secs)
+    }
+
+    private var cutoffText: String {
+        let hz = synth_cutoff_hz(host.params[Int(SYNTH_PARAM_FILTER_CUTOFF)])
+        return hz >= 1000 ? String(format: "%.1f kHz", hz / 1000) : String(format: "%.0f Hz", hz)
+    }
+
+    private func levelRow(_ title: String, level: Int) -> some View {
+        HStack(spacing: 12) {
+            Text(title).frame(width: 60, alignment: .leading)
+            Slider(value: binding(level), in: 0...1)
+            Text("\(Int((host.params[level] * 100).rounded()))%")
+                .monospacedDigit()
+                .frame(width: 46, alignment: .trailing)
+        }
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             VStack(alignment: .leading, spacing: 4) {
-                Text("SynthRL · Rudimentary Sine")
+                Text("SynthRL · Oscillators, Mixer & Filter")
                     .font(.title2.bold())
                 Text(host.status)
                     .font(.callout)
@@ -207,6 +320,59 @@ struct ContentView: View {
 
             ScopeView(buffer: host.scope)
                 .frame(height: 170)
+
+            HStack(alignment: .top, spacing: 24) {
+                oscillator("Oscillator A", wave: Int(SYNTH_PARAM_OSC_A_WAVE))
+                oscillator("Oscillator B", wave: Int(SYNTH_PARAM_OSC_B_WAVE))
+            }
+
+            HStack(alignment: .top, spacing: 24) {
+                GroupBox("Mixer") {
+                    VStack(spacing: 8) {
+                        levelRow("Osc A", level: Int(SYNTH_PARAM_OSC_A_LEVEL))
+                        levelRow("Osc B", level: Int(SYNTH_PARAM_OSC_B_LEVEL))
+                    }
+                    .padding(.vertical, 4)
+                }
+                .frame(maxWidth: .infinity)
+
+                GroupBox("Filter · Low-pass") {
+                    HStack(spacing: 16) {
+                        KnobView(
+                            title: "Cutoff",
+                            value: binding(Int(SYNTH_PARAM_FILTER_CUTOFF)),
+                            valueText: cutoffText)
+                        KnobView(
+                            title: "Resonance",
+                            value: binding(Int(SYNTH_PARAM_FILTER_RESONANCE)),
+                            valueText: "\(Int((host.params[Int(SYNTH_PARAM_FILTER_RESONANCE)] * 100).rounded()))%")
+                    }
+                    .padding(.vertical, 4)
+                }
+                .frame(maxWidth: .infinity)
+            }
+
+            GroupBox("Amp envelope · ADSR") {
+                HStack(spacing: 16) {
+                    KnobView(
+                        title: "Attack",
+                        value: binding(Int(SYNTH_PARAM_ENV_ATTACK)),
+                        valueText: timeText(Int(SYNTH_PARAM_ENV_ATTACK)))
+                    KnobView(
+                        title: "Decay",
+                        value: binding(Int(SYNTH_PARAM_ENV_DECAY)),
+                        valueText: timeText(Int(SYNTH_PARAM_ENV_DECAY)))
+                    KnobView(
+                        title: "Sustain",
+                        value: binding(Int(SYNTH_PARAM_ENV_SUSTAIN)),
+                        valueText: "\(Int((host.params[Int(SYNTH_PARAM_ENV_SUSTAIN)] * 100).rounded()))%")
+                    KnobView(
+                        title: "Release",
+                        value: binding(Int(SYNTH_PARAM_ENV_RELEASE)),
+                        valueText: timeText(Int(SYNTH_PARAM_ENV_RELEASE)))
+                }
+                .padding(.vertical, 4)
+            }
 
             KeyboardView(host: host)
                 .frame(height: 200)
@@ -223,7 +389,7 @@ struct ContentView: View {
             }
         }
         .padding(20)
-        .frame(minWidth: 680, minHeight: 540)
+        .frame(minWidth: 680, minHeight: 1040)
     }
 }
 
