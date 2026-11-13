@@ -26,6 +26,19 @@ enum {
     SYNTH_PARAM_ENV_DECAY,         // normalized 0-1, time mapped exponentially 1 ms - 10 s
     SYNTH_PARAM_ENV_SUSTAIN,       // level 0-1 (linear)
     SYNTH_PARAM_ENV_RELEASE,       // normalized 0-1, time mapped exponentially 1 ms - 10 s
+    SYNTH_PARAM_OSC_A_DETUNE,      // cents, -100 to +100
+    SYNTH_PARAM_OSC_B_DETUNE,      // cents, -100 to +100
+    SYNTH_PARAM_FILTER_ENV_AMOUNT, // 0-1: how far the filter envelope opens the cutoff (up to 5 octaves)
+    SYNTH_PARAM_FILTER_ENV_ATTACK, // normalized 0-1, 1 ms - 10 s
+    SYNTH_PARAM_FILTER_ENV_DECAY,  // normalized 0-1, 1 ms - 10 s
+    SYNTH_PARAM_FILTER_ENV_SUSTAIN,// level 0-1
+    SYNTH_PARAM_FILTER_ENV_RELEASE,// normalized 0-1, 1 ms - 10 s
+    SYNTH_PARAM_LFO_RATE,          // normalized 0-1, 0.05 Hz - 20 Hz
+    SYNTH_PARAM_LFO_PITCH_DEPTH,   // cents of vibrato, 0-100
+    SYNTH_PARAM_LFO_FILTER_DEPTH,  // 0-1: cutoff wobble, up to 2 octaves
+    SYNTH_PARAM_DRIVE,             // 0-1: soft-clip drive (0 = clean)
+    SYNTH_PARAM_REVERB_MIX,        // 0-1: dry/wet
+    SYNTH_PARAM_REVERB_SIZE,       // 0-1: room size (decay time)
     SYNTH_PARAM_COUNT
 };
 
@@ -70,6 +83,9 @@ float synth_cutoff_hz(float normalized);
 // Converts a normalized envelope time (0-1) to seconds. Exponential: 0 -> 1 ms,
 // 1 -> 10 s, so the knob is fine-grained at short times where it matters most.
 float synth_envelope_seconds(float normalized);
+
+// Converts a normalized LFO rate (0-1) to Hz. Exponential: 0 -> 0.05 Hz, 1 -> 20 Hz.
+float synth_lfo_hz(float normalized);
 
 // ---- Lifecycle and performance --------------------------------------------
 // Allocates the core. Not real-time safe; call off the audio thread.

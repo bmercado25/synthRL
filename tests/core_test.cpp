@@ -107,7 +107,12 @@ static float cutoff_for_hz(double hz) {
 int main() {
     std::printf("Filter schema and cutoff mapping\n");
     {
-        CHECK(synth_param_count() == 10, "ten parameters: osc, filter and envelope");
+        CHECK(synth_param_count() == 23, "23 parameters: osc, filter, envelopes, LFO and effects");
+        CHECK(std::strcmp(synth_param_info(SYNTH_PARAM_REVERB_MIX).id, "reverb_mix") == 0,
+              "reverb mix id");
+        CHECK(synth_param_info(SYNTH_PARAM_OSC_A_DETUNE).min == -100.0f, "detune range is +/-100 cents");
+        CHECK(synth_param_info(SYNTH_PARAM_DRIVE).defaultValue == 0.0f, "drive defaults to clean");
+        CHECK(synth_param_info(SYNTH_PARAM_REVERB_MIX).defaultValue == 0.0f, "reverb defaults to dry");
         CHECK(std::strcmp(synth_param_info(SYNTH_PARAM_FILTER_CUTOFF).id, "filter_cutoff") == 0,
               "cutoff parameter id");
         CHECK(synth_param_info(SYNTH_PARAM_FILTER_CUTOFF).defaultValue == 1.0f,
@@ -201,6 +206,96 @@ int main() {
         std::vector<float> end(out.begin() + 9600 + 33600, out.end());                  // 0.7 s after off
         CHECK(rms(mid) > 0.05, "note is still audible 100 ms into a 500 ms release");
         CHECK(peak(end) == 0.0, "silent after the release time has passed");
+    }
+
+    std::printf("Oscillator detune\n");
+    {
+        // Osc B on its own at +100 cents: one semitone up from A4, so 466.16 Hz.
+        SynthCore* s = synth_create(kSR);
+        synth_set_param(s, SYNTH_PARAM_OSC_A_LEVEL, 0.0f);
+        synth_set_param(s, SYNTH_PARAM_OSC_B_LEVEL, 1.0f);
+        synth_set_param(s, SYNTH_PARAM_OSC_B_DETUNE, 100.0f);
+        synth_note_on(s, 69, 127);
+        std::vector<float> out(kSecond);
+        synth_render(s, out.data(), kSecond);
+        synth_destroy(s);
+        CHECK(std::fabs(estimate_hz(out, kSR) - 466.16) < 2.0, "+100 cents raises A4 to 466 Hz");
+    }
+
+    std::printf("Filter envelope opens then closes the filter\n");
+    {
+        // Low base cutoff (about 100 Hz) with the envelope fully on: the note starts
+        // bright and falls back to dark after the decay.
+        SynthCore* s = synth_create(kSR);
+        synth_set_param(s, SYNTH_PARAM_OSC_A_WAVE, SYNTH_WAVE_SAW);
+        synth_set_param(s, SYNTH_PARAM_FILTER_CUTOFF, cutoff_for_hz(100.0));
+        synth_set_param(s, SYNTH_PARAM_FILTER_ENV_AMOUNT, 1.0f);
+        synth_set_param(s, SYNTH_PARAM_FILTER_ENV_ATTACK, 0.0f);      // 1 ms
+        synth_set_param(s, SYNTH_PARAM_FILTER_ENV_DECAY, 0.5f);       // about 100 ms
+        synth_set_param(s, SYNTH_PARAM_FILTER_ENV_SUSTAIN, 0.0f);
+        synth_note_on(s, 57, 127);  // A3, a saw with plenty of harmonics
+        std::vector<float> out(kSecond);
+        synth_render(s, out.data(), kSecond);
+        synth_destroy(s);
+        std::vector<float> early(out.begin() + 480, out.begin() + 1440);  // 10 - 30 ms
+        std::vector<float> late(out.begin() + 24000, out.begin() + 28800);
+        CHECK(rms(early) > rms(late) * 3.0, "filter sweep is brighter at the start of the note");
+    }
+
+    std::printf("LFO vibrato changes the pitch over time\n");
+    {
+        SynthCore* s = synth_create(kSR);
+        synth_set_param(s, SYNTH_PARAM_LFO_RATE, 0.5f);       // 1 Hz
+        synth_set_param(s, SYNTH_PARAM_LFO_PITCH_DEPTH, 100.0f);
+        synth_note_on(s, 69, 127);
+        std::vector<float> out(kSecond * 2);
+        synth_render(s, out.data(), kSecond * 2);
+        synth_destroy(s);
+        CHECK(synth_lfo_hz(0.0f) > 0.049f && synth_lfo_hz(1.0f) > 19.9f, "LFO spans 0.05 to 20 Hz");
+        CHECK(peak(out) < 1.0, "vibrato keeps output bounded");
+        // Vibrato means the output is not the same as a plain 440 Hz sine.
+        std::vector<float> plain = play_filtered(69, 1.0f, 0.0f);
+        bool differs = false;
+        for (size_t i = 0; i < kSecond; ++i) differs = differs || (out[i] != plain[i]);
+        CHECK(differs, "vibrato changes the signal");
+    }
+
+    std::printf("Drive squares up the waveform\n");
+    {
+        double clean = plateau_fraction(play_a4(SYNTH_WAVE_SINE, 1.0f, SYNTH_WAVE_SINE, 0.0f), 0.45);
+        SynthCore* s = synth_create(kSR);
+        synth_set_param(s, SYNTH_PARAM_DRIVE, 1.0f);
+        synth_note_on(s, 69, 127);
+        std::vector<float> out(kSecond);
+        synth_render(s, out.data(), kSecond);
+        synth_destroy(s);
+        CHECK(plateau_fraction(out, 0.45) > clean + 0.1, "full drive pushes the sine toward a square");
+    }
+
+    std::printf("Reverb adds a tail after the note\n");
+    {
+        // Hold 0.2 s, release, then measure 0.5 s later.
+        auto run = [](float mix) {
+            SynthCore* s = synth_create(kSR);
+            synth_set_param(s, SYNTH_PARAM_REVERB_MIX, mix);
+            synth_set_param(s, SYNTH_PARAM_REVERB_SIZE, 0.8f);
+            synth_note_on(s, 69, 127);
+            std::vector<float> out(9600 + 24000);
+            synth_render(s, out.data(), 9600);
+            synth_note_off(s, 69);
+            synth_render(s, out.data() + 9600, 24000);
+            synth_destroy(s);
+            return out;
+        };
+        std::vector<float> dry = run(0.0f);
+        std::vector<float> wet = run(0.5f);
+        std::vector<float> dryTail(dry.end() - 4800, dry.end());
+        std::vector<float> wetTail(wet.end() - 4800, wet.end());
+        CHECK(peak(dryTail) == 0.0, "no reverb: silent after release");
+        CHECK(rms(wetTail) > 0.001, "reverb: the tail keeps ringing after release");
+        bool finite = true;
+        for (float s : wet) finite = finite && std::isfinite(s);
+        CHECK(finite, "reverb output is finite");
     }
 
     std::printf("Parameter schema\n");

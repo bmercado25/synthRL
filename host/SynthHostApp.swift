@@ -259,6 +259,30 @@ struct KnobView: View {
     }
 }
 
+/// Formats a parameter's current value for display, by its index.
+@MainActor
+private func displayText(_ host: AudioHost, _ index: Int) -> String {
+    let v = host.params[index]
+    switch index {
+    case Int(SYNTH_PARAM_FILTER_CUTOFF):
+        let hz = synth_cutoff_hz(v)
+        return hz >= 1000 ? String(format: "%.1f kHz", hz / 1000) : String(format: "%.0f Hz", hz)
+    case Int(SYNTH_PARAM_ENV_ATTACK), Int(SYNTH_PARAM_ENV_DECAY), Int(SYNTH_PARAM_ENV_RELEASE),
+         Int(SYNTH_PARAM_FILTER_ENV_ATTACK), Int(SYNTH_PARAM_FILTER_ENV_DECAY), Int(SYNTH_PARAM_FILTER_ENV_RELEASE):
+        let secs = synth_envelope_seconds(v)
+        return secs < 1 ? String(format: "%.0f ms", secs * 1000) : String(format: "%.2f s", secs)
+    case Int(SYNTH_PARAM_LFO_RATE):
+        let hz = synth_lfo_hz(v)
+        return String(format: "%.2f Hz", hz)
+    case Int(SYNTH_PARAM_OSC_A_DETUNE), Int(SYNTH_PARAM_OSC_B_DETUNE):
+        return String(format: "%+.0f ct", v)
+    case Int(SYNTH_PARAM_LFO_PITCH_DEPTH):
+        return String(format: "%.0f ct", v)
+    default:
+        return "\(Int((v * 100).rounded()))%"
+    }
+}
+
 struct ContentView: View {
     @ObservedObject var host: AudioHost
 
@@ -266,15 +290,22 @@ struct ContentView: View {
         (0..<Int(synth_waveform_count())).map { String(cString: synth_waveform_name(Int32($0))) }
     }
 
-    /// Two-way binding from a parameter index to a slider or picker.
+    /// Two-way binding from a parameter index to a slider, knob or picker.
     private func binding(_ index: Int) -> Binding<Double> {
         Binding(
             get: { Double(host.params[index]) },
             set: { host.setParam(index, Float($0)) })
     }
 
-    private func oscillator(_ title: String, wave: Int) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
+    /// A rotary knob for a parameter, with its value shown underneath.
+    private func knob(_ title: String, _ index: Int) -> some View {
+        KnobView(title: title,
+                 value: binding(index),
+                 valueText: displayText(host, index))
+    }
+
+    private func oscillator(_ title: String, wave: Int, detune: Int) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
             Text(title).font(.headline)
             Picker("Waveform", selection: binding(wave)) {
                 ForEach(Array(waveNames.enumerated()), id: \.offset) { i, name in
@@ -283,19 +314,11 @@ struct ContentView: View {
             }
             .pickerStyle(.segmented)
             .labelsHidden()
+            HStack {
+                knob("Detune", detune)
+            }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-    }
-
-    /// Shows an envelope time in ms (under 1 s) or seconds.
-    private func timeText(_ index: Int) -> String {
-        let secs = synth_envelope_seconds(host.params[index])
-        return secs < 1 ? String(format: "%.0f ms", secs * 1000) : String(format: "%.2f s", secs)
-    }
-
-    private var cutoffText: String {
-        let hz = synth_cutoff_hz(host.params[Int(SYNTH_PARAM_FILTER_CUTOFF)])
-        return hz >= 1000 ? String(format: "%.1f kHz", hz / 1000) : String(format: "%.0f Hz", hz)
     }
 
     private func levelRow(_ title: String, level: Int) -> some View {
@@ -309,87 +332,96 @@ struct ContentView: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            VStack(alignment: .leading, spacing: 4) {
-                Text("SynthRL · Oscillators, Mixer & Filter")
-                    .font(.title2.bold())
-                Text(host.status)
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-            }
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("SynthRL · v1 Synth")
+                        .font(.title2.bold())
+                    Text(host.status)
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
 
-            ScopeView(buffer: host.scope)
-                .frame(height: 170)
+                ScopeView(buffer: host.scope)
+                    .frame(height: 170)
 
-            HStack(alignment: .top, spacing: 24) {
-                oscillator("Oscillator A", wave: Int(SYNTH_PARAM_OSC_A_WAVE))
-                oscillator("Oscillator B", wave: Int(SYNTH_PARAM_OSC_B_WAVE))
-            }
+                HStack(alignment: .top, spacing: 24) {
+                    oscillator("Oscillator A", wave: SYNTH_PARAM_OSC_A_WAVE, detune: SYNTH_PARAM_OSC_A_DETUNE)
+                    oscillator("Oscillator B", wave: SYNTH_PARAM_OSC_B_WAVE, detune: SYNTH_PARAM_OSC_B_DETUNE)
+                }
 
-            HStack(alignment: .top, spacing: 24) {
                 GroupBox("Mixer") {
                     VStack(spacing: 8) {
-                        levelRow("Osc A", level: Int(SYNTH_PARAM_OSC_A_LEVEL))
-                        levelRow("Osc B", level: Int(SYNTH_PARAM_OSC_B_LEVEL))
+                        levelRow("Osc A", level: SYNTH_PARAM_OSC_A_LEVEL)
+                        levelRow("Osc B", level: SYNTH_PARAM_OSC_B_LEVEL)
                     }
                     .padding(.vertical, 4)
                 }
-                .frame(maxWidth: .infinity)
 
                 GroupBox("Filter · Low-pass") {
                     HStack(spacing: 16) {
-                        KnobView(
-                            title: "Cutoff",
-                            value: binding(Int(SYNTH_PARAM_FILTER_CUTOFF)),
-                            valueText: cutoffText)
-                        KnobView(
-                            title: "Resonance",
-                            value: binding(Int(SYNTH_PARAM_FILTER_RESONANCE)),
-                            valueText: "\(Int((host.params[Int(SYNTH_PARAM_FILTER_RESONANCE)] * 100).rounded()))%")
+                        knob("Cutoff", SYNTH_PARAM_FILTER_CUTOFF)
+                        knob("Resonance", SYNTH_PARAM_FILTER_RESONANCE)
+                        knob("Env amount", SYNTH_PARAM_FILTER_ENV_AMOUNT)
                     }
                     .padding(.vertical, 4)
                 }
-                .frame(maxWidth: .infinity)
-            }
 
-            GroupBox("Amp envelope · ADSR") {
-                HStack(spacing: 16) {
-                    KnobView(
-                        title: "Attack",
-                        value: binding(Int(SYNTH_PARAM_ENV_ATTACK)),
-                        valueText: timeText(Int(SYNTH_PARAM_ENV_ATTACK)))
-                    KnobView(
-                        title: "Decay",
-                        value: binding(Int(SYNTH_PARAM_ENV_DECAY)),
-                        valueText: timeText(Int(SYNTH_PARAM_ENV_DECAY)))
-                    KnobView(
-                        title: "Sustain",
-                        value: binding(Int(SYNTH_PARAM_ENV_SUSTAIN)),
-                        valueText: "\(Int((host.params[Int(SYNTH_PARAM_ENV_SUSTAIN)] * 100).rounded()))%")
-                    KnobView(
-                        title: "Release",
-                        value: binding(Int(SYNTH_PARAM_ENV_RELEASE)),
-                        valueText: timeText(Int(SYNTH_PARAM_ENV_RELEASE)))
+                GroupBox("Filter envelope · ADSR") {
+                    HStack(spacing: 16) {
+                        knob("Attack", SYNTH_PARAM_FILTER_ENV_ATTACK)
+                        knob("Decay", SYNTH_PARAM_FILTER_ENV_DECAY)
+                        knob("Sustain", SYNTH_PARAM_FILTER_ENV_SUSTAIN)
+                        knob("Release", SYNTH_PARAM_FILTER_ENV_RELEASE)
+                    }
+                    .padding(.vertical, 4)
                 }
-                .padding(.vertical, 4)
-            }
 
-            KeyboardView(host: host)
-                .frame(height: 200)
+                GroupBox("Amp envelope · ADSR") {
+                    HStack(spacing: 16) {
+                        knob("Attack", SYNTH_PARAM_ENV_ATTACK)
+                        knob("Decay", SYNTH_PARAM_ENV_DECAY)
+                        knob("Sustain", SYNTH_PARAM_ENV_SUSTAIN)
+                        knob("Release", SYNTH_PARAM_ENV_RELEASE)
+                    }
+                    .padding(.vertical, 4)
+                }
 
-            HStack(spacing: 12) {
-                Text("Velocity")
-                Slider(value: $host.velocity, in: 1...127)
-                Text("\(Int(host.velocity))")
-                    .monospacedDigit()
-                    .frame(width: 34, alignment: .trailing)
-                Spacer()
-                Text(host.activeNote.map { "Playing \(noteName($0))" } ?? "Idle")
-                    .foregroundStyle(.secondary)
+                GroupBox("LFO") {
+                    HStack(spacing: 16) {
+                        knob("Rate", SYNTH_PARAM_LFO_RATE)
+                        knob("Pitch depth", SYNTH_PARAM_LFO_PITCH_DEPTH)
+                        knob("Filter depth", SYNTH_PARAM_LFO_FILTER_DEPTH)
+                    }
+                    .padding(.vertical, 4)
+                }
+
+                GroupBox("Effects") {
+                    HStack(spacing: 16) {
+                        knob("Drive", SYNTH_PARAM_DRIVE)
+                        knob("Reverb mix", SYNTH_PARAM_REVERB_MIX)
+                        knob("Reverb size", SYNTH_PARAM_REVERB_SIZE)
+                    }
+                    .padding(.vertical, 4)
+                }
+
+                KeyboardView(host: host)
+                    .frame(height: 200)
+
+                HStack(spacing: 12) {
+                    Text("Velocity")
+                    Slider(value: $host.velocity, in: 1...127)
+                    Text("\(Int(host.velocity))")
+                        .monospacedDigit()
+                        .frame(width: 34, alignment: .trailing)
+                    Spacer()
+                    Text(host.activeNote.map { "Playing \(noteName($0))" } ?? "Idle")
+                        .foregroundStyle(.secondary)
+                }
             }
+            .padding(20)
         }
-        .padding(20)
-        .frame(minWidth: 680, minHeight: 1040)
+        .frame(minWidth: 760, minHeight: 900)
     }
 }
 

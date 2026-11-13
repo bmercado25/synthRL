@@ -2,9 +2,11 @@
 
 #include <atomic>
 #include <cmath>
+#include <vector>
 
 namespace {
 
+const double kPi = 3.141592653589793;
 const double kTwoPi = 6.283185307179586;
 const double kMasterAmplitude = 0.5;
 
@@ -17,24 +19,59 @@ const SynthParamInfo kParams[SYNTH_PARAM_COUNT] = {
     {"oscB_level", "Osc B Level",    SYNTH_PARAM_CONTINUOUS, 0.0f, 1.0f, 0.0f},
     {"filter_cutoff",    "Filter Cutoff",    SYNTH_PARAM_CONTINUOUS, 0.0f, 1.0f, 1.0f},
     {"filter_resonance", "Filter Resonance", SYNTH_PARAM_CONTINUOUS, 0.0f, 1.0f, 0.0f},
-    // Defaults: attack 5 ms, decay 100 ms, sustain full, release 50 ms.
+    // Amp envelope. Defaults: attack 5 ms, decay 100 ms, sustain full, release 50 ms.
     {"env_attack",  "Attack",  SYNTH_PARAM_CONTINUOUS, 0.0f, 1.0f, 0.1748f},
     {"env_decay",   "Decay",   SYNTH_PARAM_CONTINUOUS, 0.0f, 1.0f, 0.5f},
     {"env_sustain", "Sustain", SYNTH_PARAM_CONTINUOUS, 0.0f, 1.0f, 1.0f},
     {"env_release", "Release", SYNTH_PARAM_CONTINUOUS, 0.0f, 1.0f, 0.4257f},
+    {"oscA_detune", "Osc A Detune", SYNTH_PARAM_CONTINUOUS, -100.0f, 100.0f, 0.0f},
+    {"oscB_detune", "Osc B Detune", SYNTH_PARAM_CONTINUOUS, -100.0f, 100.0f, 0.0f},
+    // Filter envelope. Defaults give a closed filter until the amount is raised.
+    {"filter_env_amount",  "Filter Env Amount",  SYNTH_PARAM_CONTINUOUS, 0.0f, 1.0f, 0.0f},
+    {"filter_env_attack",  "Filter Attack",      SYNTH_PARAM_CONTINUOUS, 0.0f, 1.0f, 0.1748f},
+    {"filter_env_decay",   "Filter Decay",       SYNTH_PARAM_CONTINUOUS, 0.0f, 1.0f, 0.5f},
+    {"filter_env_sustain", "Filter Sustain",     SYNTH_PARAM_CONTINUOUS, 0.0f, 1.0f, 0.0f},
+    {"filter_env_release", "Filter Release",     SYNTH_PARAM_CONTINUOUS, 0.0f, 1.0f, 0.4257f},
+    // LFO. Defaults: 1 Hz, no modulation.
+    {"lfo_rate",         "LFO Rate",          SYNTH_PARAM_CONTINUOUS, 0.0f, 1.0f, 0.5f},
+    {"lfo_pitch_depth",  "LFO Pitch Depth",   SYNTH_PARAM_CONTINUOUS, 0.0f, 100.0f, 0.0f},
+    {"lfo_filter_depth", "LFO Filter Depth",  SYNTH_PARAM_CONTINUOUS, 0.0f, 1.0f, 0.0f},
+    // Effects. Defaults: clean, dry.
+    {"drive",        "Drive",        SYNTH_PARAM_CONTINUOUS, 0.0f, 1.0f, 0.0f},
+    {"reverb_mix",   "Reverb Mix",   SYNTH_PARAM_CONTINUOUS, 0.0f, 1.0f, 0.0f},
+    {"reverb_size",  "Reverb Size",  SYNTH_PARAM_CONTINUOUS, 0.0f, 1.0f, 0.5f},
 };
 
 const double kMinCutoffHz = 20.0;
 const double kMaxCutoffHz = 20000.0;
-
 const double kMinEnvSeconds = 0.001;
 const double kMaxEnvSeconds = 10.0;
+const double kMinLfoHz = 0.05;
+const double kMaxLfoHz = 20.0;
 
 // Resonance maps to the SVF damping term k (k = 1/Q). k = sqrt(2) is a flat,
 // Butterworth response. Lower k gives a peak at the cutoff. k is kept at
 // 0.1 or above (Q up to 10) so the filter stays well behaved.
 const double kFlatDamping = 1.4142135623730951;
 const double kMinDamping = 0.1;
+
+// Filter envelope and LFO range, in octaves of cutoff.
+const double kFilterEnvOctaves = 5.0;
+const double kLfoFilterOctaves = 2.0;
+
+// Drive: soft clip with input gain from 1x (clean) to 10x.
+const double kDriveMaxGain = 9.0;
+
+// Reverb (Freeverb-style): 8 damped combs and 4 allpasses, mono.
+// Tunings are for 44.1 kHz and are scaled to the actual sample rate.
+const int kCombTunings[8] = {1116, 1188, 1277, 1356, 1422, 1491, 1557, 1617};
+const int kAllpassTunings[4] = {556, 441, 341, 225};
+const double kTuningRate = 44100.0;
+const double kReverbDamp = 0.4;
+const double kReverbInputGain = 0.015;
+const double kReverbWetScale = 3.0;
+const double kReverbFeedbackMin = 0.7;
+const double kReverbFeedbackRange = 0.28;
 
 const char* const kWaveNames[SYNTH_WAVE_COUNT] = {"Sine", "Saw", "Square", "Triangle"};
 
@@ -93,9 +130,54 @@ int clamp_int(float v, int lo, int hi) {
     return i;
 }
 
+// ADSR envelope. Level runs 0-1. Attack and release start from the current
+// level, so retriggering or releasing early does not click.
+struct Envelope {
+    int stage = kEnvIdle;
+    double level = 0.0;
+
+    void noteOn() { stage = kEnvAttack; }
+
+    void noteOff() {
+        if (stage != kEnvIdle) stage = kEnvRelease;
+    }
+
+    // Steps are the change in level per sample for each stage.
+    void tick(double attackStep, double decayStep, double releaseStep, double sustain) {
+        switch (stage) {
+            case kEnvAttack:
+                level += attackStep;
+                if (level >= 1.0) {
+                    level = 1.0;
+                    stage = kEnvDecay;
+                }
+                break;
+            case kEnvDecay:
+                level -= decayStep;
+                if (level <= sustain) {
+                    level = sustain;
+                    stage = kEnvSustain;
+                }
+                break;
+            case kEnvSustain:
+                level = sustain;
+                break;
+            case kEnvRelease:
+                level -= releaseStep;
+                if (level <= 0.0) {
+                    level = 0.0;
+                    stage = kEnvIdle;
+                }
+                break;
+            default:  // kEnvIdle
+                level = 0.0;
+                break;
+        }
+    }
+};
+
 // Topology-preserving state-variable filter (Zavalishin's TPT form). Stable at
-// any cutoff below Nyquist, which matters because the cutoff can be swept to
-// the top of its range. Only the low-pass output is used.
+// any cutoff below Nyquist. Only the low-pass output is used.
 struct SvfLowpass {
     double ic1 = 0.0;  // integrator 1 state
     double ic2 = 0.0;  // integrator 2 state
@@ -114,6 +196,70 @@ struct SvfLowpass {
     }
 };
 
+struct CombFilter {
+    std::vector<double> buf;
+    int idx = 0;
+    double store = 0.0;
+
+    void resize(int n) {
+        buf.assign(static_cast<size_t>(n), 0.0);
+        idx = 0;
+        store = 0.0;
+    }
+
+    double process(double input, double feedback, double damp) {
+        const double out = buf[idx];
+        store = out * (1.0 - damp) + store * damp;
+        buf[idx] = input + store * feedback;
+        if (++idx >= static_cast<int>(buf.size())) idx = 0;
+        return out;
+    }
+};
+
+struct AllpassFilter {
+    std::vector<double> buf;
+    int idx = 0;
+
+    void resize(int n) {
+        buf.assign(static_cast<size_t>(n), 0.0);
+        idx = 0;
+    }
+
+    double process(double input) {
+        const double bufout = buf[idx];
+        const double out = -input + bufout;
+        buf[idx] = input + bufout * 0.5;
+        if (++idx >= static_cast<int>(buf.size())) idx = 0;
+        return out;
+    }
+};
+
+// Mono Freeverb-style reverb. Buffers are allocated in configure(), which is
+// called off the audio thread, so process() never allocates.
+struct Reverb {
+    CombFilter combs[8];
+    AllpassFilter allpasses[4];
+
+    void configure(double sampleRate) {
+        const double scale = sampleRate / kTuningRate;
+        for (int i = 0; i < 8; ++i) {
+            combs[i].resize(static_cast<int>(kCombTunings[i] * scale));
+        }
+        for (int i = 0; i < 4; ++i) {
+            allpasses[i].resize(static_cast<int>(kAllpassTunings[i] * scale));
+        }
+    }
+
+    // Returns the wet signal only. The caller mixes it with the dry signal.
+    double processWet(double input, double feedback) {
+        const double x = input * kReverbInputGain;
+        double sum = 0.0;
+        for (auto& c : combs) sum += c.process(x, feedback, kReverbDamp);
+        for (auto& a : allpasses) sum = a.process(sum);
+        return sum * kReverbWetScale;
+    }
+};
+
 }  // namespace
 
 float synth_cutoff_hz(float normalized) {
@@ -128,23 +274,33 @@ float synth_envelope_seconds(float normalized) {
     return static_cast<float>(kMinEnvSeconds * std::pow(kMaxEnvSeconds / kMinEnvSeconds, normalized));
 }
 
+float synth_lfo_hz(float normalized) {
+    if (normalized < 0.0f) normalized = 0.0f;
+    if (normalized > 1.0f) normalized = 1.0f;
+    return static_cast<float>(kMinLfoHz * std::pow(kMaxLfoHz / kMinLfoHz, normalized));
+}
+
 struct SynthCore {
     double sampleRate = 44100.0;
-    double cyclesPerSample = 0.0;
+    double baseHz = 0.0;       // frequency of the held note, before detune and LFO (0 = silent)
     Oscillator oscA;
     Oscillator oscB;
     SvfLowpass filter;
-
-    // Amplitude envelope (ADSR). Level runs 0-1 and is scaled by the note's velocity.
-    int envStage = kEnvIdle;
-    double envLevel = 0.0;
+    Envelope ampEnv;
+    Envelope filterEnv;
     double velocityGain = 0.0;
-
+    double lfoPhase = 0.0;     // cycles, [0,1)
+    Reverb reverb;
     int activeNote = -1;
 
     // Written by the UI thread, read by the render thread.
     std::atomic<float> params[SYNTH_PARAM_COUNT];
 };
+
+// Converts a normalized envelope parameter to a per-sample step.
+static double env_step(float normalized, double sampleRate) {
+    return 1.0 / (synth_envelope_seconds(normalized) * sampleRate);
+}
 
 // ---- Parameter schema ------------------------------------------------------
 
@@ -187,6 +343,7 @@ float synth_get_param(SynthCore* core, int index) {
 SynthCore* synth_create(double sample_rate) {
     SynthCore* core = new SynthCore();
     core->sampleRate = sample_rate;
+    core->reverb.configure(sample_rate);
     for (int i = 0; i < SYNTH_PARAM_COUNT; ++i) {
         core->params[i].store(kParams[i].defaultValue, std::memory_order_relaxed);
     }
@@ -198,7 +355,9 @@ void synth_destroy(SynthCore* core) {
 }
 
 void synth_set_sample_rate(SynthCore* core, double sample_rate) {
-    if (core) core->sampleRate = sample_rate;
+    if (!core) return;
+    core->sampleRate = sample_rate;
+    core->reverb.configure(sample_rate);  // off the audio thread
 }
 
 void synth_note_on(SynthCore* core, int note, int velocity) {
@@ -206,12 +365,15 @@ void synth_note_on(SynthCore* core, int note, int velocity) {
         synth_note_off(core, note);
         return;
     }
-    const double hz = 440.0 * std::pow(2.0, (note - 69) / 12.0);
     core->activeNote = note;
-    core->cyclesPerSample = hz / core->sampleRate;
+    core->baseHz = 440.0 * std::pow(2.0, (note - 69) / 12.0);
+    // Start each note at the same oscillator phase, so a patch always sounds
+    // the same when played the same way (needed for deterministic renders).
+    core->oscA.phase = 0.0;
+    core->oscB.phase = 0.0;
     core->velocityGain = kMasterAmplitude * (velocity / 127.0);
-    // Attack starts from the current level, so a retrigger does not click.
-    core->envStage = kEnvAttack;
+    core->ampEnv.noteOn();
+    core->filterEnv.noteOn();
 }
 
 void synth_note_off(SynthCore* core, int note) {
@@ -219,79 +381,82 @@ void synth_note_off(SynthCore* core, int note) {
         return;
     }
     core->activeNote = -1;
-    if (core->envStage != kEnvIdle) {
-        // Release starts from the current level, wherever the envelope is.
-        core->envStage = kEnvRelease;
-    }
+    core->ampEnv.noteOff();
+    core->filterEnv.noteOff();
 }
 
 void synth_render(SynthCore* core, float* out, int frames) {
-    // Read parameters once per block.
-    const int waveA = clamp_int(core->params[SYNTH_PARAM_OSC_A_WAVE].load(std::memory_order_relaxed),
-                                0, SYNTH_WAVE_COUNT - 1);
-    const int waveB = clamp_int(core->params[SYNTH_PARAM_OSC_B_WAVE].load(std::memory_order_relaxed),
-                                0, SYNTH_WAVE_COUNT - 1);
-    const double levelA = core->params[SYNTH_PARAM_OSC_A_LEVEL].load(std::memory_order_relaxed);
-    const double levelB = core->params[SYNTH_PARAM_OSC_B_LEVEL].load(std::memory_order_relaxed);
-    const double cps = core->cyclesPerSample;
-
-    // Filter coefficients, once per block. Cutoff is clamped below Nyquist so
-    // tan() stays finite and the response stays sensible.
-    const double cutoffHz = synth_cutoff_hz(
-        core->params[SYNTH_PARAM_FILTER_CUTOFF].load(std::memory_order_relaxed));
-    const double resonance = core->params[SYNTH_PARAM_FILTER_RESONANCE].load(std::memory_order_relaxed);
-    const double fc = std::fmin(cutoffHz, 0.45 * core->sampleRate);
-    const double g = std::tan(3.141592653589793 * fc / core->sampleRate);
-    const double k = kFlatDamping + (kMinDamping - kFlatDamping) * resonance;
-
-    // Envelope rates, once per block. Each stage moves the level by a fixed
-    // fraction of full scale per sample, so a longer time means a slower slope.
     const double sr = core->sampleRate;
-    const double attackStep = 1.0 / (synth_envelope_seconds(
-        core->params[SYNTH_PARAM_ENV_ATTACK].load(std::memory_order_relaxed)) * sr);
-    const double decayStep = 1.0 / (synth_envelope_seconds(
-        core->params[SYNTH_PARAM_ENV_DECAY].load(std::memory_order_relaxed)) * sr);
-    const double releaseStep = 1.0 / (synth_envelope_seconds(
-        core->params[SYNTH_PARAM_ENV_RELEASE].load(std::memory_order_relaxed)) * sr);
-    const double sustain = core->params[SYNTH_PARAM_ENV_SUSTAIN].load(std::memory_order_relaxed);
+    auto load = [core](int i) {
+        return static_cast<double>(core->params[i].load(std::memory_order_relaxed));
+    };
+
+    // Read parameters once per block.
+    const int waveA = clamp_int(static_cast<float>(load(SYNTH_PARAM_OSC_A_WAVE)), 0, SYNTH_WAVE_COUNT - 1);
+    const int waveB = clamp_int(static_cast<float>(load(SYNTH_PARAM_OSC_B_WAVE)), 0, SYNTH_WAVE_COUNT - 1);
+    const double levelA = load(SYNTH_PARAM_OSC_A_LEVEL);
+    const double levelB = load(SYNTH_PARAM_OSC_B_LEVEL);
+    const double detuneA = load(SYNTH_PARAM_OSC_A_DETUNE);
+    const double detuneB = load(SYNTH_PARAM_OSC_B_DETUNE);
+
+    const double baseCutoffHz = synth_cutoff_hz(static_cast<float>(load(SYNTH_PARAM_FILTER_CUTOFF)));
+    const double resonance = load(SYNTH_PARAM_FILTER_RESONANCE);
+    const double k = kFlatDamping + (kMinDamping - kFlatDamping) * resonance;
+    const double filterEnvOctaves = load(SYNTH_PARAM_FILTER_ENV_AMOUNT) * kFilterEnvOctaves;
+
+    const double lfoInc = synth_lfo_hz(static_cast<float>(load(SYNTH_PARAM_LFO_RATE))) / sr;
+    const double lfoPitchCents = load(SYNTH_PARAM_LFO_PITCH_DEPTH);
+    const double lfoFilterOctaves = load(SYNTH_PARAM_LFO_FILTER_DEPTH) * kLfoFilterOctaves;
+
+    const double drive = load(SYNTH_PARAM_DRIVE);
+    const double driveGain = 1.0 + kDriveMaxGain * drive;
+    const double driveNorm = std::tanh(driveGain);
+
+    const double reverbMix = load(SYNTH_PARAM_REVERB_MIX);
+    const double reverbFeedback = kReverbFeedbackMin + kReverbFeedbackRange * load(SYNTH_PARAM_REVERB_SIZE);
+
+    // Envelope steps, once per block.
+    const double ampAttack = env_step(static_cast<float>(load(SYNTH_PARAM_ENV_ATTACK)), sr);
+    const double ampDecay = env_step(static_cast<float>(load(SYNTH_PARAM_ENV_DECAY)), sr);
+    const double ampRelease = env_step(static_cast<float>(load(SYNTH_PARAM_ENV_RELEASE)), sr);
+    const double ampSustain = load(SYNTH_PARAM_ENV_SUSTAIN);
+    const double fltAttack = env_step(static_cast<float>(load(SYNTH_PARAM_FILTER_ENV_ATTACK)), sr);
+    const double fltDecay = env_step(static_cast<float>(load(SYNTH_PARAM_FILTER_ENV_DECAY)), sr);
+    const double fltRelease = env_step(static_cast<float>(load(SYNTH_PARAM_FILTER_ENV_RELEASE)), sr);
+    const double fltSustain = load(SYNTH_PARAM_FILTER_ENV_SUSTAIN);
+
+    const double baseCps = core->baseHz / sr;
 
     for (int i = 0; i < frames; ++i) {
-        // ADSR envelope.
-        switch (core->envStage) {
-            case kEnvAttack:
-                core->envLevel += attackStep;
-                if (core->envLevel >= 1.0) {
-                    core->envLevel = 1.0;
-                    core->envStage = kEnvDecay;
-                }
-                break;
-            case kEnvDecay:
-                core->envLevel -= decayStep;
-                if (core->envLevel <= sustain) {
-                    core->envLevel = sustain;
-                    core->envStage = kEnvSustain;
-                }
-                break;
-            case kEnvSustain:
-                core->envLevel = sustain;
-                break;
-            case kEnvRelease:
-                core->envLevel -= releaseStep;
-                if (core->envLevel <= 0.0) {
-                    core->envLevel = 0.0;
-                    core->envStage = kEnvIdle;
-                }
-                break;
-            default:  // kEnvIdle
-                core->envLevel = 0.0;
-                break;
-        }
+        // LFO: sine, free running.
+        const double lfo = std::sin(kTwoPi * core->lfoPhase);
+        core->lfoPhase += lfoInc;
+        if (core->lfoPhase >= 1.0) core->lfoPhase -= 1.0;
+
+        core->ampEnv.tick(ampAttack, ampDecay, ampRelease, ampSustain);
+        core->filterEnv.tick(fltAttack, fltDecay, fltRelease, fltSustain);
+
+        // Pitch: detune plus LFO vibrato. Cents -> frequency ratio is 2^(c/1200).
+        const double cpsA = baseCps * std::exp2((detuneA + lfoPitchCents * lfo) / 1200.0);
+        const double cpsB = baseCps * std::exp2((detuneB + lfoPitchCents * lfo) / 1200.0);
 
         // Mixer: each oscillator scaled by its level, then summed.
-        const double mixed = levelA * core->oscA.next(waveA, cps) +
-                             levelB * core->oscB.next(waveB, cps);
-        // One filter on the mixed signal, then the amplitude envelope.
-        const double filtered = core->filter.process(mixed, g, k);
-        out[i] = static_cast<float>(core->velocityGain * core->envLevel * filtered);
+        const double mixed = levelA * core->oscA.next(waveA, cpsA) +
+                             levelB * core->oscB.next(waveB, cpsB);
+
+        // Drive: soft clip, normalized so the peak stays near full scale.
+        const double shaped = drive > 0.0 ? std::tanh(mixed * driveGain) / driveNorm : mixed;
+
+        // Filter: base cutoff, opened by the filter envelope and moved by the LFO.
+        double cutoff = baseCutoffHz *
+                        std::exp2(filterEnvOctaves * core->filterEnv.level + lfoFilterOctaves * lfo);
+        cutoff = std::fmin(std::fmax(cutoff, kMinCutoffHz), 0.45 * sr);
+        const double g = std::tan(kPi * cutoff / sr);
+        const double filtered = core->filter.process(shaped, g, k);
+
+        // Amp envelope and velocity, then reverb after the envelope so the tail rings out.
+        const double dry = core->velocityGain * core->ampEnv.level * filtered;
+        const double wet = core->reverb.processWet(dry, reverbFeedback);
+        out[i] = static_cast<float>(dry * (1.0 - reverbMix) + wet * reverbMix);
     }
 }

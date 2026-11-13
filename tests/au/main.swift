@@ -152,6 +152,11 @@ do {
         (0, "oscA_wave"), (1, "oscA_level"), (2, "oscB_wave"), (3, "oscB_level"),
         (4, "filter_cutoff"), (5, "filter_resonance"),
         (6, "env_attack"), (7, "env_decay"), (8, "env_sustain"), (9, "env_release"),
+        (10, "oscA_detune"), (11, "oscB_detune"),
+        (12, "filter_env_amount"), (13, "filter_env_attack"), (14, "filter_env_decay"),
+        (15, "filter_env_sustain"), (16, "filter_env_release"),
+        (17, "lfo_rate"), (18, "lfo_pitch_depth"), (19, "lfo_filter_depth"),
+        (20, "drive"), (21, "reverb_mix"), (22, "reverb_size"),
     ]
     for (address, identifier) in expected {
         check(tree.parameter(withAddress: address)?.identifier == identifier,
