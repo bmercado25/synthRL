@@ -1,0 +1,15 @@
+# Build and test output (everything scripts/test.sh writes lives here)
+build/
+
+# Test artifacts that might be written elsewhere
+*.wav
+*.o
+*.log
+
+# Swift / Xcode leftovers
+.build/
+DerivedData/
+*.xcuserstate
+
+# macOS
+.DS_Store
