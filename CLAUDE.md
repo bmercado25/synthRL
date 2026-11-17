@@ -106,9 +106,9 @@ Each phase ends with something testable. Do not start a later phase to avoid a f
 ## Open questions
 
 1. Which generator gives the best mix of waveform quality, controllability and inference speed?
-2. Can it play across a wide MIDI range?
+2. Can it play across a wide MIDI range? *Partial (step 0 spike, random-weight DDSP-style harmonic decoder, `spikes/step0_render_speed.py`): all 88 notes (MIDI 21-108) render with the spectral peak within 50 cents of a harmonic of f0. This checks the harmonic path only, not a trained model or perceived pitch.*
 3. Which representations support meaningful latent manipulation?
-4. Is generation fast enough for continuous background exploration?
+4. Is generation fast enough for continuous background exploration? *Partial (same spike): the tiny decoder runs at about 0.001-0.004 of real time per voice on CPU and MPS. That is far below a realistic neural vocoder's cost, so it is an optimistic floor, not a verdict.*
 5. Which RL algorithm works best for continuous synthesis parameters, and does it beat the baselines?
 6. How should human preference feedback be incorporated?
 7. How does exploration stay stable while the user changes parameters?
@@ -124,7 +124,7 @@ Each phase ends with something testable. Do not start a later phase to avoid a f
 - Minimum OS targets:
 - Parameter schema file location:
 - Test phrase files location:
-- Python environment:
+- Python environment: Python 3.12 in `.venv/` at the repo root (`uv venv --python 3.12 .venv`), pinned in `spikes/requirements.lock`. PyTorch 2.15 with MPS (Apple GPU) available. The venv is git-ignored
 - Generator model and version:
 
 ## Decision log
