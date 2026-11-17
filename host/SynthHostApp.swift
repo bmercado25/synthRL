@@ -6,6 +6,7 @@ import AudioToolbox
 import AVFAudio
 import Combine
 import SwiftUI
+import UniformTypeIdentifiers
 
 private let synthDescription = AudioComponentDescription(
     componentType: synthComponentType,
@@ -71,6 +72,35 @@ final class AudioHost: ObservableObject {
             model.status = "ERROR · \(e.localizedDescription) (\(e.code))"
         }
     }
+
+    /// Opens a timbre file made by `python -m neural.export` and loads it into the
+    /// synth. The host is unsandboxed, so it reads the file itself; the AU only
+    /// receives the parsed harmonics.
+    func loadTimbre() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.json]
+        panel.canChooseDirectories = false
+        panel.message = "Choose a timbre file made by neural.export"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            let data = try Data(contentsOf: url)
+            guard let doc = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  doc["format"] as? String == "synth-timbre",
+                  let values = doc["harmonics"] as? [Double] else {
+                throw NSError(domain: "SynthRL", code: 1,
+                              userInfo: [NSLocalizedDescriptionKey: "not a synth-timbre file"])
+            }
+            guard let synth = unit?.auAudioUnit as? SynthAudioUnit else {
+                throw NSError(domain: "SynthRL", code: 2,
+                              userInfo: [NSLocalizedDescriptionKey: "audio is not running yet"])
+            }
+            synth.loadTimbre(values.map { Float($0) })
+            model.params[Int(SYNTH_PARAM_SOURCE_MIX)] = 1
+            model.status = "TIMBRE · \(url.lastPathComponent)"
+        } catch {
+            model.status = "TIMBRE ERROR · \(error.localizedDescription)"
+        }
+    }
 }
 
 @main
@@ -81,6 +111,9 @@ struct SynthHostApp: App {
         WindowGroup("SynthRL") {
             ContentView(model: host.model)
                 .task { await host.start() }
+                .toolbar {
+                    Button("Load Timbre…") { host.loadTimbre() }
+                }
         }
         // Open at the content's ideal size so everything fits without scrolling.
         .windowResizability(.contentMinSize)

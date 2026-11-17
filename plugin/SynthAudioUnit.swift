@@ -28,6 +28,13 @@ final class SynthKernel {
         synth_set_param(core, Int32(index), value)
     }
 
+    /// Builds the neural-source wavetables. Not real-time safe: call off the audio thread.
+    func setTimbre(_ harmonics: [Float]) {
+        harmonics.withUnsafeBufferPointer { buffer in
+            synth_set_timbre(core, buffer.baseAddress, Int32(buffer.count))
+        }
+    }
+
     func handleMIDI(status: UInt8, data1: UInt8, data2: UInt8) {
         switch status & 0xF0 {
         case 0x90: synth_note_on(core, Int32(data1), Int32(data2))
@@ -89,6 +96,14 @@ public final class SynthAudioUnit: AUAudioUnit {
         for parameter in parameters {
             kernel.setParam(Int(parameter.address), parameter.value)
         }
+    }
+
+    /// Loads a neural-source timbre (harmonic amplitudes, fundamental first) and
+    /// sets Source Mix to 1 so it is heard. Call from the main thread, not the audio thread.
+    public func loadTimbre(_ harmonics: [Float]) {
+        kernel.setTimbre(harmonics)
+        let address = AUParameterAddress(Int(SYNTH_PARAM_SOURCE_MIX))
+        parameterTree?.parameter(withAddress: address)?.value = 1
     }
 
     public override var outputBusses: AUAudioUnitBusArray { outputBusArray }

@@ -16,3 +16,7 @@ DerivedData/
 
 # Python spike environment (uv venv --python 3.12 .venv)
 .venv/
+
+# Python bytecode and pytest cache
+__pycache__/
+.pytest_cache/

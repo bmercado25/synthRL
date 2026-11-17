@@ -163,6 +163,7 @@ do {
         (15, "filter_env_sustain"), (16, "filter_env_release"),
         (17, "lfo_rate"), (18, "lfo_pitch_depth"), (19, "lfo_filter_depth"),
         (20, "drive"), (21, "reverb_mix"), (22, "reverb_size"),
+        (23, "source_mix"),
     ]
     for (address, identifier) in expected {
         check(tree.parameter(withAddress: address)?.identifier == identifier,
@@ -208,6 +209,21 @@ do {
     let slowAttackOut = try rendered { $0.parameter(withAddress: 6)?.value = 0.675 }
     let earlySlice = Array(slowAttackOut[0..<480])
     check(rms(earlySlice) < rms(defaultOut) * 0.2, "a slow attack fades the note in")
+
+    print("Neural source loads through the AU")
+    let (engineT, hostT) = try makeHost()
+    let sourceMix = hostT.auAudioUnit.parameterTree!.parameter(withAddress: 23)
+    check(sourceMix?.value == 0, "source mix defaults to 0 (oscillators only)")
+    // A pure sine timbre played at A4 must come out at 440 Hz.
+    (hostT.auAudioUnit as! SynthAudioUnit).loadTimbre([1.0])
+    check(sourceMix?.value == 1, "loading a timbre turns source mix on")
+    _ = sendMIDI(hostT, 0x90, 69, 127)
+    let timbreOut = try render(engineT, seconds: 1.0)[0]
+    var crossings = 0
+    for i in 1..<timbreOut.count where timbreOut[i - 1] <= 0 && timbreOut[i] > 0 { crossings += 1 }
+    let hz = Double(crossings) * sampleRate / Double(timbreOut.count)
+    check(abs(hz - 440) < 4.4, "loaded timbre plays A4 at 440 Hz (got \(String(format: "%.1f", hz)))")
+    check(peak(timbreOut) > 0.05, "loaded timbre is audible")
 
     let out = CommandLine.arguments.count > 1 ? CommandLine.arguments[1] : "build/au_output.wav"
     try writeWAV(tone, to: out)

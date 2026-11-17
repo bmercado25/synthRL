@@ -23,6 +23,16 @@ diff -u schema/synth_params.json build/synth_params.json || {
 }
 echo "parameter schema matches schema/synth_params.json"
 
+# Python side of the neural source (analysis, timbre files). Needs the venv
+# from CLAUDE.md ("Python environment"); skipped loudly if it is missing.
+echo
+echo "### Python source pipeline tests"
+if [ -x .venv/bin/python ]; then
+    .venv/bin/python -m pytest neural/tests -q
+else
+    echo "SKIPPED: no .venv. Create it as described in CLAUDE.md"
+fi
+
 echo
 echo "### 2/3 Build AUv3"
 ./scripts/build.sh > build/build.log 2>&1 || { cat build/build.log; exit 1; }

@@ -141,3 +141,4 @@ Each phase ends with something testable. Do not start a later phase to avoid a f
 | 2026-11-16 | Shell is AUv3 (Swift AUAudioUnit wrapper, SwiftUI host app) over the portable C++ core; no JUCE, no VST3 for now | Matches the existing project code (core/, plugin/, host/, ui/). Keeps the DSP portable so a VST3 or JUCE shell can be added later without rewriting it |
 | 2026-11-16 | Human feedback is part of the core loop, not a late phase | KEEP, DISCARD, FAVORITE, MORE/LESS LIKE THIS guide exploration from the start |
 | 2026-11-16 | Presets store the recipe, with optional cached audio | Neural regeneration may not be exactly reproducible |
+| 2026-11-16 | Step 2a is analysis-resynthesis (pYIN f0, harmonic timbre, no training); the trained generator comes after the hand-off works | Proves sample import, the core's neural source path and the host loader end to end before model quality is at stake. Known limit: magnitudes only, no phase or noise |

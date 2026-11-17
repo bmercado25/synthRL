@@ -40,6 +40,8 @@ const SynthParamInfo kParams[SYNTH_PARAM_COUNT] = {
     {"drive",        "Drive",        SYNTH_PARAM_CONTINUOUS, 0.0f, 1.0f, 0.0f},
     {"reverb_mix",   "Reverb Mix",   SYNTH_PARAM_CONTINUOUS, 0.0f, 1.0f, 0.0f},
     {"reverb_size",  "Reverb Size",  SYNTH_PARAM_CONTINUOUS, 0.0f, 1.0f, 0.5f},
+    // Neural source. Defaults to 0 so the oscillators alone make the sound.
+    {"source_mix",   "Source Mix",   SYNTH_PARAM_CONTINUOUS, 0.0f, 1.0f, 0.0f},
 };
 
 const double kMinCutoffHz = 20.0;
@@ -260,6 +262,78 @@ struct Reverb {
     }
 };
 
+// ---- Neural source (timbre) wavetables -------------------------------------
+// The timbre is a set of harmonic amplitudes. It is turned into one bandlimited
+// single-cycle wavetable per octave band, so a high note never contains
+// harmonics above Nyquist. Bands are built off the audio thread and swapped in
+// with an atomic index (see SynthCore::timbreFront).
+
+const int kWaveTableSize = 2048;
+const int kWaveBands = 10;
+const double kBandBaseHz = 40.0;   // band b covers fundamentals up to 40 Hz * 2^b
+const double kTimbreNyquistLimit = 0.45;  // fraction of the sample rate
+
+struct TimbreSet {
+    float harmonics[SYNTH_TIMBRE_MAX_HARMONICS] = {};
+    // One extra sample per table so linear interpolation can wrap without a branch.
+    float tables[kWaveBands][kWaveTableSize + 1] = {};
+};
+
+// Builds all bands from `harmonics` into `set`, at sample rate `sr`.
+// Allocates nothing: the storage lives inside TimbreSet.
+void build_timbre(TimbreSet& set, const float* harmonics, int count, double sr) {
+    for (int k = 0; k < SYNTH_TIMBRE_MAX_HARMONICS; ++k) {
+        set.harmonics[k] = (k < count) ? harmonics[k] : 0.0f;
+    }
+
+    // Normalize so the full (all-harmonic) cycle peaks at 1.0. Every band uses
+    // the same scale, so a band switch does not change the loudness.
+    double fullPeak = 0.0;
+    for (int n = 0; n < kWaveTableSize; ++n) {
+        double s = 0.0;
+        for (int k = 1; k <= SYNTH_TIMBRE_MAX_HARMONICS; ++k) {
+            s += set.harmonics[k - 1] * std::sin(kTwoPi * k * n / kWaveTableSize);
+        }
+        fullPeak = std::fmax(fullPeak, std::fabs(s));
+    }
+    const double scale = fullPeak > 0.0 ? 1.0 / fullPeak : 0.0;
+
+    for (int b = 0; b < kWaveBands; ++b) {
+        const double topHz = kBandBaseHz * std::pow(2.0, b);
+        int kmax = static_cast<int>(std::floor(kTimbreNyquistLimit * sr / topHz));
+        if (kmax > SYNTH_TIMBRE_MAX_HARMONICS) kmax = SYNTH_TIMBRE_MAX_HARMONICS;
+        for (int n = 0; n < kWaveTableSize; ++n) {
+            double s = 0.0;
+            for (int k = 1; k <= kmax; ++k) {
+                s += set.harmonics[k - 1] * std::sin(kTwoPi * k * n / kWaveTableSize);
+            }
+            set.tables[b][n] = static_cast<float>(s * scale);
+        }
+        set.tables[b][kWaveTableSize] = set.tables[b][0];
+    }
+}
+
+// Band whose table is alias-free for a note at `hz`.
+int band_for_hz(double hz) {
+    for (int b = 0; b < kWaveBands - 1; ++b) {
+        if (hz <= kBandBaseHz * std::pow(2.0, b)) return b;
+    }
+    return kWaveBands - 1;
+}
+
+// Reads the wavetable for a note at `hz` (`cps` cycles per sample) and advances `phase`.
+double read_timbre(const TimbreSet& set, double hz, double cps, double& phase) {
+    const int band = band_for_hz(hz);
+    const double pos = phase * kWaveTableSize;
+    int i = static_cast<int>(pos);
+    const double frac = pos - i;
+    const float* t = set.tables[band];
+    const double out = t[i] + frac * (t[i + 1] - t[i]);
+    phase += cps;
+    if (phase >= 1.0) phase -= 1.0;
+    return out;
+}
+
 // One sounding note: its own oscillators, filter and envelopes. Voices are
 // summed, then drive and reverb are applied to the mix.
 struct Voice {
@@ -270,6 +344,7 @@ struct Voice {
     unsigned long long order = 0;    // start order, used to steal the oldest voice
     Oscillator oscA;
     Oscillator oscB;
+    double tablePhase = 0.0;         // neural source phase, cycles [0,1)
     SvfLowpass filter;
     Envelope ampEnv;
     Envelope filterEnv;
@@ -305,6 +380,14 @@ struct SynthCore {
     unsigned long long nextOrder = 1;
     double lfoPhase = 0.0;     // cycles, [0,1)
     Reverb reverb;
+
+    // Two timbre sets. The render thread reads timbreFront once per block; the
+    // UI thread builds into the other set and then publishes it. -1 = no timbre.
+    // Known limit: two publishes within one block could overlap the set the
+    // render thread is still reading. Fine for UI-driven loads; step 4 needs a
+    // proper triple buffer before timbres change during exploration.
+    TimbreSet timbreSets[2];
+    std::atomic<int> timbreFront{-1};
 
     // Written by the UI thread, read by the render thread.
     std::atomic<float> params[SYNTH_PARAM_COUNT];
@@ -371,6 +454,27 @@ void synth_set_sample_rate(SynthCore* core, double sample_rate) {
     if (!core) return;
     core->sampleRate = sample_rate;
     core->reverb.configure(sample_rate);  // off the audio thread
+    // The bandlimit depends on the sample rate, so rebuild a loaded timbre.
+    const int front = core->timbreFront.load(std::memory_order_acquire);
+    if (front >= 0) {
+        const int back = 1 - front;
+        build_timbre(core->timbreSets[back], core->timbreSets[front].harmonics,
+                     SYNTH_TIMBRE_MAX_HARMONICS, sample_rate);
+        core->timbreFront.store(back, std::memory_order_release);
+    }
+}
+
+void synth_set_timbre(SynthCore* core, const float* harmonics, int count) {
+    if (!core) return;
+    if (count <= 0 || !harmonics) {
+        core->timbreFront.store(-1, std::memory_order_release);
+        return;
+    }
+    if (count > SYNTH_TIMBRE_MAX_HARMONICS) count = SYNTH_TIMBRE_MAX_HARMONICS;
+    const int front = core->timbreFront.load(std::memory_order_acquire);
+    const int back = front == 0 ? 1 : 0;
+    build_timbre(core->timbreSets[back], harmonics, count, core->sampleRate);
+    core->timbreFront.store(back, std::memory_order_release);
 }
 
 void synth_note_on(SynthCore* core, int note, int velocity) {
@@ -403,6 +507,7 @@ void synth_note_on(SynthCore* core, int note, int velocity) {
     // always sounds the same when played the same way (needed for deterministic renders).
     chosen->oscA.phase = 0.0;
     chosen->oscB.phase = 0.0;
+    chosen->tablePhase = 0.0;
     chosen->filter = SvfLowpass();
     chosen->velocityGain = kMasterAmplitude * (velocity / 127.0);
     chosen->ampEnv.noteOn();
@@ -451,6 +556,11 @@ void synth_render(SynthCore* core, float* out, int frames) {
     const double reverbMix = load(SYNTH_PARAM_REVERB_MIX);
     const double reverbFeedback = kReverbFeedbackMin + kReverbFeedbackRange * load(SYNTH_PARAM_REVERB_SIZE);
 
+    // Neural source: how much of the timbre to hear, and which table set to read.
+    const double sourceMix = std::fmin(std::fmax(load(SYNTH_PARAM_SOURCE_MIX), 0.0), 1.0);
+    const int timbreIndex = core->timbreFront.load(std::memory_order_acquire);
+    const TimbreSet* timbre = timbreIndex >= 0 ? &core->timbreSets[timbreIndex] : nullptr;
+
     // Envelope steps, once per block.
     const double ampAttack = env_step(static_cast<float>(load(SYNTH_PARAM_ENV_ATTACK)), sr);
     const double ampDecay = env_step(static_cast<float>(load(SYNTH_PARAM_ENV_DECAY)), sr);
@@ -478,8 +588,13 @@ void synth_render(SynthCore* core, float* out, int frames) {
             // Pitch: detune plus LFO vibrato. Cents -> frequency ratio is 2^(c/1200).
             const double cpsA = baseCps * std::exp2((detuneA + lfoPitchCents * lfo) / 1200.0);
             const double cpsB = baseCps * std::exp2((detuneB + lfoPitchCents * lfo) / 1200.0);
-            const double raw = levelA * v.oscA.next(waveA, cpsA) +
-                               levelB * v.oscB.next(waveB, cpsB);
+            const double oscMix = levelA * v.oscA.next(waveA, cpsA) +
+                                  levelB * v.oscB.next(waveB, cpsB);
+            // Neural source follows osc A's pitch, including detune and vibrato.
+            double raw = (1.0 - sourceMix) * oscMix;
+            if (sourceMix > 0.0 && timbre) {
+                raw += sourceMix * read_timbre(*timbre, cpsA * sr, cpsA, v.tablePhase);
+            }
 
             // Filter: base cutoff, opened by this voice's envelope and moved by the LFO.
             double cutoff = baseCutoffHz *

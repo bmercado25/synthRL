@@ -23,6 +23,7 @@
     {"index": 19, "id": "lfo_filter_depth", "name": "LFO Filter Depth", "type": "continuous", "min": 0, "max": 1, "default": 0},
     {"index": 20, "id": "drive", "name": "Drive", "type": "continuous", "min": 0, "max": 1, "default": 0},
     {"index": 21, "id": "reverb_mix", "name": "Reverb Mix", "type": "continuous", "min": 0, "max": 1, "default": 0},
-    {"index": 22, "id": "reverb_size", "name": "Reverb Size", "type": "continuous", "min": 0, "max": 1, "default": 0.5}
+    {"index": 22, "id": "reverb_size", "name": "Reverb Size", "type": "continuous", "min": 0, "max": 1, "default": 0.5},
+    {"index": 23, "id": "source_mix", "name": "Source Mix", "type": "continuous", "min": 0, "max": 1, "default": 0}
   ]
 }
