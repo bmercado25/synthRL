@@ -122,7 +122,7 @@ Each phase ends with something testable. Do not start a later phase to avoid a f
 - Repository layout: `core/` (portable C++ DSP, `synth_core.h/.cpp`), `plugin/` (AUv3 wrapper, bridging header, Info.plist, entitlements), `ui/` (SwiftUI controls), `host/` (SwiftUI host app), `tests/` (`core_test.cpp`, `au/main.swift`), `scripts/` (build, install, test)
 - Build system: shell scripts over `clang++` and `swiftc` (Command Line Tools, no full Xcode required). `scripts/build.sh` produces `build/SynthHost.app` with the AUv3 extension embedded and ad-hoc signed
 - Minimum OS targets:
-- Parameter schema file location:
+- Parameter schema file location: `schema/synth_params.json`, generated from the core by `tools/export_schema.cpp`. `scripts/test.sh` fails if it is stale
 - Test phrase files location:
 - Python environment: Python 3.12 in `.venv/` at the repo root (`uv venv --python 3.12 .venv`), pinned in `spikes/requirements.lock`. PyTorch 2.15 with MPS (Apple GPU) available. The venv is git-ignored
 - Generator model and version:

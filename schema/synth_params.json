@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "parameters": [
+    {"index": 0, "id": "oscA_wave", "name": "Osc A Waveform", "type": "waveform", "min": 0, "max": 3, "default": 0},
+    {"index": 1, "id": "oscA_level", "name": "Osc A Level", "type": "continuous", "min": 0, "max": 1, "default": 1},
+    {"index": 2, "id": "oscB_wave", "name": "Osc B Waveform", "type": "waveform", "min": 0, "max": 3, "default": 0},
+    {"index": 3, "id": "oscB_level", "name": "Osc B Level", "type": "continuous", "min": 0, "max": 1, "default": 0},
+    {"index": 4, "id": "filter_cutoff", "name": "Filter Cutoff", "type": "continuous", "min": 0, "max": 1, "default": 1},
+    {"index": 5, "id": "filter_resonance", "name": "Filter Resonance", "type": "continuous", "min": 0, "max": 1, "default": 0},
+    {"index": 6, "id": "env_attack", "name": "Attack", "type": "continuous", "min": 0, "max": 1, "default": 0.1748},
+    {"index": 7, "id": "env_decay", "name": "Decay", "type": "continuous", "min": 0, "max": 1, "default": 0.5},
+    {"index": 8, "id": "env_sustain", "name": "Sustain", "type": "continuous", "min": 0, "max": 1, "default": 1},
+    {"index": 9, "id": "env_release", "name": "Release", "type": "continuous", "min": 0, "max": 1, "default": 0.4257},
+    {"index": 10, "id": "oscA_detune", "name": "Osc A Detune", "type": "continuous", "min": -100, "max": 100, "default": 0},
+    {"index": 11, "id": "oscB_detune", "name": "Osc B Detune", "type": "continuous", "min": -100, "max": 100, "default": 0},
+    {"index": 12, "id": "filter_env_amount", "name": "Filter Env Amount", "type": "continuous", "min": 0, "max": 1, "default": 0},
+    {"index": 13, "id": "filter_env_attack", "name": "Filter Attack", "type": "continuous", "min": 0, "max": 1, "default": 0.1748},
+    {"index": 14, "id": "filter_env_decay", "name": "Filter Decay", "type": "continuous", "min": 0, "max": 1, "default": 0.5},
+    {"index": 15, "id": "filter_env_sustain", "name": "Filter Sustain", "type": "continuous", "min": 0, "max": 1, "default": 0},
+    {"index": 16, "id": "filter_env_release", "name": "Filter Release", "type": "continuous", "min": 0, "max": 1, "default": 0.4257},
+    {"index": 17, "id": "lfo_rate", "name": "LFO Rate", "type": "continuous", "min": 0, "max": 1, "default": 0.5},
+    {"index": 18, "id": "lfo_pitch_depth", "name": "LFO Pitch Depth", "type": "continuous", "min": 0, "max": 100, "default": 0},
+    {"index": 19, "id": "lfo_filter_depth", "name": "LFO Filter Depth", "type": "continuous", "min": 0, "max": 1, "default": 0},
+    {"index": 20, "id": "drive", "name": "Drive", "type": "continuous", "min": 0, "max": 1, "default": 0},
+    {"index": 21, "id": "reverb_mix", "name": "Reverb Mix", "type": "continuous", "min": 0, "max": 1, "default": 0},
+    {"index": 22, "id": "reverb_size", "name": "Reverb Size", "type": "continuous", "min": 0, "max": 1, "default": 0.5}
+  ]
+}

@@ -12,6 +12,17 @@ echo "### 1/3 Core tests"
 clang++ -std=c++17 -O2 -Wall -Wextra core/synth_core.cpp tests/core_test.cpp -o build/core_test
 ./build/core_test
 
+# The parameter schema is the single source of truth. The committed JSON that
+# the Python side reads must match what the core currently declares.
+clang++ -std=c++17 -O2 -Wall -Wextra -Icore core/synth_core.cpp tools/export_schema.cpp -o build/export_schema
+./build/export_schema > build/synth_params.json
+diff -u schema/synth_params.json build/synth_params.json || {
+    echo "schema/synth_params.json is stale. Regenerate with:"
+    echo "  ./build/export_schema > schema/synth_params.json"
+    exit 1
+}
+echo "parameter schema matches schema/synth_params.json"
+
 echo
 echo "### 2/3 Build AUv3"
 ./scripts/build.sh > build/build.log 2>&1 || { cat build/build.log; exit 1; }
