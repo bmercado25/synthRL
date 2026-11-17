@@ -1,67 +1,93 @@
-# Generative Synthesizer: Project Context
+# Neural Synth: Project Context
 
-An Apple AUv3 subtractive synthesizer, built from scratch, designed so a reinforcement learning system can later discover presets on top of it. The RL system finds presets that match a goal (a reference sound or a text description) and keeps the results diverse.
+An AI-powered synthesizer plugin built as an AUv3 Audio Unit on macOS, with a SwiftUI host app. The DSP lives in a portable C++ core. A neural audio generator creates the underlying waveform from an imported sample, and a reinforcement learning agent explores new sounds live while the user plays. The user watches, auditions and guides the exploration, and every discovery can be saved as a reproducible preset.
 
-Read this file before making architectural decisions. The full plan lives in the project document "AI-Driven Generative Synthesizer: Project Plan & Technical Architecture".
+Read this file before making architectural decisions. The full plan lives in the project document "Neural Synth: Product Requirements & Technical Architecture".
 
 ## Core idea
 
-An autonomous sound-design system that learns to operate its own synthesizer.
+An autonomous AI sound designer operating inside a synthesizer.
 
-1. A goal is encoded as a vector `g` by a frozen, pretrained audio-text embedding model (e.g. CLAP). Audio and text goals share one space.
-2. A goal-conditioned SAC agent refines a patch over 10 to 20 steps per episode.
-3. Many episodes run in parallel. Final patches go into a discovery archive.
-4. A novelty bonus (gated on goal similarity) keeps discoveries distinct.
-5. The plugin itself plots the archive as an exploration map for the user to audition. There is no separate companion app; everything runs inside the same plugin.
+1. The user imports an audio sample (WAV first). The analysis engine extracts a learned representation `z_src` that keeps both temporal and spectral information.
+2. A reusable neural generator, conditioned on `z_src`, renders playable audio for any MIDI pitch and velocity. It is never retrained per sample and never just resamples the source.
+3. An exploration agent runs continuously in the background after the user presses EXPLORE. Each cycle: choose an action, build a candidate, render it, analyze it, compute the reward, publish it for auditioning, update state.
+4. The user plays and auditions while exploration continues. KEEP, DISCARD, FAVORITE, MORE LIKE THIS and LESS LIKE THIS feed back into the agent.
+5. Candidates form an exploration tree (original sample at the root). Any node can be auditioned, compared with its parent, branched from, or saved as a preset.
+6. Traditional synth controls (filter, ADSR, LFO, modulation matrix, effects, AI MORPH) sit on top of the neural source. Everything runs inside the same plugin; there is no separate companion app.
 
-## Architecture rules (these keep the RL layer possible)
+## Architecture rules
 
-1. **Portable DSP core.** All DSP is a C++ library with no Apple dependencies. The AUv3 is a thin wrapper. The same core runs in the plugin, an offline renderer and a Python module.
-2. **Parameters declared once.** A single schema holds each parameter's ID, name, range, default, normalized 0-1 mapping, and continuous/discrete type. The `AUParameterTree` is generated from it, and it is exported as JSON for the Python side. Never hand-declare a parameter in two places.
-3. **Deterministic offline rendering.** `render(patch, midi_phrase, sample_rate, seconds) -> audio`, faster than real time, with no dependence on the audio thread or a host. All randomness (noise, LFO phase) is seeded. The same patch must always render the same audio.
-4. **Patch = flat parameter vector + schema version.** Presets save and load through the AU's full state, so discovered patches open directly in the plugin.
-5. **Modular internals.** Build the signal path as modules with routable connections, even if the first UI is a conventional synth panel.
-6. **Nothing learned in the audio thread.** Training and candidate evaluation run out of process. The plugin only loads and plays presets.
-7. **Training does not host the AUv3.** AUv3 extensions are sandboxed and awkward to drive in bulk. Training uses the portable core directly.
-8. **Real-time safety.** No allocation, locks, file I/O or logging in the render callback.
+1. **Three independent systems.** Audio thread (playback, MIDI, filters, envelopes, modulation, effects), neural generation worker (inference, buffers, pre/post-processing), RL exploration worker (actions, evaluation, policy updates, history, feedback). The audio thread never waits on inference or training. Never run expensive inference or RL training in the audio callback.
+2. **Safe hand-off.** Thread-safe queues and double-buffering move generated audio to the playback engine. Candidate switching is click-free (crossfade). Candidate generation never blocks the UI.
+3. **Reusable conditioned generator.** One neural generator, conditioned on the source embedding. Pitch and velocity are inputs, so the instrument plays across a useful range. Latent representations support continuous manipulation (needed for AI MORPH).
+4. **Replaceable parts.** The neural generator, exploration algorithm, reward system, DSP engine and UI are separate modules. Swapping the exploration algorithm must not require changes to the generator.
+5. **Parameters declared once.** A single schema holds each parameter's ID, name, range, default, normalized 0-1 mapping and continuous/discrete type, for both the traditional controls and the generator conditioning parameters. Host parameters are generated from it and it is exported as JSON for the Python side. Never hand-declare a parameter in two places.
+6. **Portable DSP core.** Filters, envelopes, LFOs, modulation matrix, waveform manipulation and effects live in a C++ library with no plugin-framework dependency, so the plugin, a standalone prototype and offline tools share it.
+7. **Candidate = recipe, not audio.** A candidate stores generator version, conditioning data, latent vector, synthesis parameters, RL action history, reward components, parent ID, feedback and timestamp. Presets save the recipe, not just a waveform.
+8. **Reproducibility.** Seed all randomness and pin the generator version. Exact neural regeneration is not guaranteed, so presets may carry an optional cached audio representation as a fallback.
+9. **User controls are independent of exploration.** The user can edit the current candidate while the agent keeps exploring. PAUSE preserves exploration state. STOP is immediate and never interrupts playback.
+10. **Honest synthesis graph.** The graph shows the real processing chain (for example Neural Source → Harmonic Processor → Wavefolder → Filter → Amplifier). Do not invent an oscillator architecture for a neural source.
+11. **Visualization is a projection.** The latent-space view (UMAP or PCA) is not the true geometry of the model's latent space. Label it that way.
+12. **Real-time safety.** No allocation, locks, file I/O or logging in the render callback. Bounded memory. Safe parameter updates.
+13. **Resource fallbacks.** Handle missing GPU gracefully. Provide a fallback mode for machines that cannot run the model at the preferred speed.
+14. **Deployment.** The first prototype may use a separate local inference process. The shipped plugin must not need a permanently running Python environment.
 
-## Synth v1 scope
+## Synth scope
 
-- Two oscillators (waveform selection, detune), mixer
-- Low-pass filter with resonance
-- ADSR envelopes, LFO with modulation depth
-- Reverb and basic effects
-- MIDI input
+- **Neural oscillator section:** generated waveform display, latent-space position, neural variation, harmonic complexity, waveform morphing, phase manipulation, optional folding
+- **Waveform manipulation:** wavetable-style scanning where supported, wavefolding, bit reduction, FM, AM, phase distortion, nonlinear distortion (processing operations, not oscillator sources)
+- **Filter:** low-pass, high-pass, band-pass, notch; cutoff, resonance, envelope amount, drive
+- **Envelopes:** ADSR for amplitude and filter
+- **LFO:** rate, depth, waveform, phase, sync, destination
+- **Modulation matrix:** latent variables, harmonic complexity, cutoff, resonance, distortion, amplitude, pitch, other supported parameters
+- **Effects:** reverb, delay, chorus, saturation, stereo widening, compression
+- **AI MORPH:** 0% original-inspired, 50% hybrid, 100% highly transformed. It operates on the learned representation or generator conditioning, not by crossfading unrelated audio. Interpolation must keep perceptual continuity.
 
-Keep the parameter space small. Prefer continuous controls: for example, a saw-to-square blend instead of a hard waveform switch, because discrete actions are awkward for SAC.
+Build the parameter space incrementally. Prefer continuous controls over discrete switches.
 
-## RL summary
+## Audio analysis
 
-- **Algorithm:** Soft Actor-Critic, run as iterative refinement. Each step applies bounded adjustments to normalized parameters, clipped to 0-1.
-- **Observation:** `s = [g, p, e, f, z]` (goal embedding, current parameters, embedding of current audio, cheap DSP features, optional per-episode style vector).
-- **Per-step reward:** improvement in cosine similarity between the rendered audio embedding and the goal.
-- **Final reward:** similarity + gated novelty bonus - penalties (silence, clipping, DC offset, runaway resonance).
-- **Novelty:** mean distance to the k nearest neighbours (k around 5-15) in the archive, in embedding space. Never in parameter space.
-- **Hindsight relabeling:** substitute the embedding of the sound actually produced as the goal, so failed attempts still teach the parameter-to-sound mapping.
-- **Diversity mechanisms, in order:** novelty bonus, latent style vector `z`, MAP-Elites archive over interpretable descriptors (brightness, attack time, modulation rate). Investigate PGA-MAP-Elites.
-- **Embedding model stays frozen.** Archive distances are only meaningful if embeddings are computed identically every time.
-- **Fixed test phrases** (held chord, slow melody, staccato line) are used for every evaluation, since perceived character depends on the notes played.
+Extract f0 and pitch, harmonic structure, spectral centroid, bandwidth, rolloff and flux, zero-crossing rate, transients, ADSR characteristics, temporal envelope, noise characteristics, inharmonicity, MFCCs, and embeddings from a learned audio encoder. Do not collapse the sample to a single vector if that discards temporal information.
+
+## Neural generator
+
+Candidates to investigate: DDSP, neural waveform generators, neural vocoders, conditional generative audio models, latent-variable audio models, neural spectral synthesis. Inputs: source embedding, current latent, MIDI pitch, velocity, note duration, generation parameters, modulation parameters, optional exploration conditioning. Investigate existing research and implementations before building a new model from scratch.
+
+## RL and exploration summary
+
+- **Policy:** contextual, `π(a | s, z)`, where `s` is the exploration state and `z` the encoded source audio.
+- **State:** current candidate parameters, generated audio features, previous scores, exploration history, user feedback, source embedding.
+- **Actions:** modify latents, harmonic complexity, brightness, transients, distortion, noise, FM, spectral envelope, temporal behavior; try other configurations; mutate promising candidates; vary saved candidates.
+- **Algorithms to compare:** PPO, SAC, contextual bandits, evolutionary strategies. Judge on stability, compute cost, exploration quality and ability to use human feedback. Do not assume PPO.
+- **Reward:** `R = w1·S + w2·N + w3·P + w4·M + w5·U` (similarity, novelty, playability, perceptual quality, user preference). Each term is independently configurable.
+  - *S:* spectral, mel-spectrogram, harmonic, transient and embedding similarity.
+  - *N:* distance to existing candidates. Never reward noise or distortion just for being different.
+  - *P:* pitch consistency, velocity response, transients, note transitions, stability across the MIDI range, artifacts.
+  - *U:* contextual feedback. A rejected candidate is not universally bad. Preference can persist across sessions only if the user enables personalization.
+- **Embedding model stays frozen** wherever embeddings are compared, so distances stay meaningful.
+- **Fixed test phrases** (held chord, slow melody, staccato line) are used for every evaluation.
+- **Personalities** are reward weightings or policy-conditioning parameters, not separate generators: Faithful, Experimental, Harmonic, Organic, Evolution (population plus mutation and branching), Human-Guided.
+- **Live controls:** Novelty, Similarity, Exploration Speed (scheduling and throughput only, never audio sample rate), plus depth, mutation strength, population size, retention, seed, temperature, feedback influence. Transport: START EXPLORING, PAUSE, RESUME, STOP, RESET, SAVE DISCOVERY.
 
 ## Baselines the RL must beat
 
-Random search, CMA-ES, and a supervised inverse model trained on (parameters, embedding) pairs. If RL does not beat these on the same goals and render budget, it is not yet justified. A supervised model may also warm-start the policy.
+A lightweight evolutionary or Bayesian explorer comes first, before any RL. Also compare random search, CMA-ES and a supervised inverse model trained on (parameters, embedding) pairs. If RL does not beat these on the same goals and render budget, it is not yet justified.
+
+## Visualization
+
+Waveform view (original vs generated), spectrogram view, latent-space view, synthesis graph, exploration tree, reward components, current policy actions, candidate history.
 
 ## Roadmap
 
-1. Portable DSP core, parameter schema, deterministic offline renderer, Python binding
-2. AUv3 wrapper (parameter tree from schema, MIDI, presets); verify offline render matches the plugin
-3. Audio analysis: test phrases, DSP features, frozen embeddings, throughput measurement
-4. Baselines: random search, CMA-ES, supervised inverse model
-5. Goal-conditioned SAC with hindsight relabeling on audio-matching goals
-6. Diversity: archive, novelty bonus, latent `z`, MAP-Elites, parallel environments
-7. Plugin UI: exploration map, auditioning, comparison, preset export (in the plugin, not a separate app)
-8. Text goals and human preference learning
-9. Modular synthesis expansion
+1. Neural sound generation prototype: sample import, analysis, conditional generator, pitch and velocity conditioning, playback, simple preset
+2. Live exploration: candidate parameter space, background worker, queues, waveform display, auditioning, A/B, save/discard, baseline search
+3. Reward and evaluation: similarity, novelty, playability, ranking, user feedback, history
+4. Reinforcement learning: contextual policy, observation and action spaces, personalities, branching, comparison with baselines
+5. Synthesizer interface: filters, ADSR, LFOs, mod matrix, waveform manipulation, effects, AI MORPH, MIDI, presets
+6. Exploration visualization: waveform, spectrogram, latent map, tree, reward and action displays
+7. Plugin integration and optimization: AUv3 wrapper (AUAudioUnit) around the C++ core, thread-safe model communication, inference optimization, preset I/O, MIDI validation, audio-thread stability, long-run tests, CPU and memory profiling
+
+First establish three things before expanding: a neural generator that produces playable conditioned audio, a background exploration engine that never interrupts playback, and a feedback mechanism that guides exploration.
 
 Each phase ends with something testable. Do not start a later phase to avoid a failing earlier one.
 
@@ -69,37 +95,49 @@ Each phase ends with something testable. Do not start a later phase to avoid a f
 
 | Component | Technology |
 | --- | --- |
-| DSP core | C++ |
-| Plugin | AUv3 Audio Unit instrument |
-| Plugin UI | SwiftUI / AppKit |
-| Python access to engine | pybind11 or headless CLI renderer |
-| RL | PyTorch, SAC |
-| Parallel environments | Python multiprocessing initially |
-| Audio analysis | librosa / custom DSP |
-| Embeddings | Pretrained audio-text model (e.g. CLAP), frozen |
+| Plugin and DSP | C++ portable core, Swift AUAudioUnit wrapper, AUv3 Audio Unit (macOS) |
+| Host app and UI | SwiftUI with AppKit where needed (AU view controller via CoreAudioKit) |
+| Neural generation | PyTorch, DDSP, neural audio models, audio embedding models |
+| Audio analysis | librosa, torchaudio, custom C++ DSP analysis |
+| RL | Stable-Baselines3 (initial experiments), PPO, SAC, custom contextual policies, evolutionary baselines |
+| Visualization | SwiftUI / AppKit views, GPU (Metal) waveform rendering where needed, custom spectrogram, graph view for the tree |
+| Prototype inference | Separate local process (shipped plugin must not depend on Python) |
 
 ## Open questions
 
-1. Does goal-conditioned SAC with hindsight relabeling beat the baselines on audio-matching goals?
-2. Does the embedding model's text space align with how people describe synth sounds?
-3. Does a gated novelty bonus produce a spread-out archive, or is a latent `z` needed?
-4. How many renders and embeddings per second can the pipeline sustain?
-5. How well do automated scores agree with human ratings?
+1. Which generator gives the best mix of waveform quality, controllability and inference speed?
+2. Can it play across a wide MIDI range?
+3. Which representations support meaningful latent manipulation?
+4. Is generation fast enough for continuous background exploration?
+5. Which RL algorithm works best for continuous synthesis parameters, and does it beat the baselines?
+6. How should human preference feedback be incorporated?
+7. How does exploration stay stable while the user changes parameters?
+8. Can presets be reconstructed reliably without storing audio?
+9. What is the best strategy for CPU-only inference?
+10. Can several candidate-generation workers run at once?
+11. How well do automated scores agree with human ratings?
 
 ## Conventions (fill in as decisions are made)
 
-- Repository layout:
-- Build system:
-- Minimum macOS / iOS targets:
+- Repository layout: `core/` (portable C++ DSP, `synth_core.h/.cpp`), `plugin/` (AUv3 wrapper, bridging header, Info.plist, entitlements), `ui/` (SwiftUI controls), `host/` (SwiftUI host app), `tests/` (`core_test.cpp`, `au/main.swift`), `scripts/` (build, install, test)
+- Build system: shell scripts over `clang++` and `swiftc` (Command Line Tools, no full Xcode required). `scripts/build.sh` produces `build/SynthHost.app` with the AUv3 extension embedded and ad-hoc signed
+- Minimum OS targets:
 - Parameter schema file location:
 - Test phrase files location:
 - Python environment:
+- Generator model and version:
 
 ## Decision log
 
 | Date | Decision | Reason |
 | --- | --- | --- |
-| 2026-11-12 | Build the AUv3 synth from scratch around a portable C++ core | Lets the same DSP run in the plugin, an offline renderer and Python for RL training |
-| 2026-11-12 | Goals are embedding vectors, not hand-picked emotion dimensions | Richer, learned space; audio and text goals share one policy |
-| 2026-11-12 | Iterative-refinement SAC with gated novelty bonus | Inspectable steps; diversity measured in sound space |
-| 2026-11-12 | No companion app; exploration map, auditioning, comparison and preset export live inside the plugin | One codebase and one deliverable; the plugin already holds the core, the presets and the audio |
+| 2026-11-12 | Build the synth around a portable C++ core | Lets the same DSP run in the plugin, a standalone prototype and offline tools |
+| 2026-11-12 | Goals are embedding vectors | Richer, learned space; source audio conditions one shared policy |
+| 2026-11-12 | No companion app; map, auditioning, comparison and export live inside the plugin | One codebase and one deliverable |
+| 2026-11-12 | Iterative-refinement SAC with gated novelty bonus | **Superseded 2026-11-16:** SAC is now one of several algorithms to compare, behind an evolutionary baseline |
+| 2026-11-16 | Sound source is a neural generator, not classic oscillators | Core product idea from the Neural Synth spec; classic DSP kept for filter, envelopes, modulation and effects |
+| 2026-11-16 | Exploration runs live inside the plugin on background workers, off the audio thread | Defining feature of the product. Replaces the earlier "nothing learned in the plugin" rule; the audio thread still never runs inference or training |
+| 2026-11-16 | Target VST3 and AU with JUCE | **Superseded 2026-11-16 by the AUv3 decision below** |
+| 2026-11-16 | Shell is AUv3 (Swift AUAudioUnit wrapper, SwiftUI host app) over the portable C++ core; no JUCE, no VST3 for now | Matches the existing project code (core/, plugin/, host/, ui/). Keeps the DSP portable so a VST3 or JUCE shell can be added later without rewriting it |
+| 2026-11-16 | Human feedback is part of the core loop, not a late phase | KEEP, DISCARD, FAVORITE, MORE/LESS LIKE THIS guide exploration from the start |
+| 2026-11-16 | Presets store the recipe, with optional cached audio | Neural regeneration may not be exactly reproducible |
