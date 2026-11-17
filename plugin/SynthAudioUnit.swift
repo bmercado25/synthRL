@@ -72,9 +72,13 @@ func makeSynthParameters() -> [AUParameter] {
     }
 }
 
+/// Key under which the timbre is stored in AUAudioUnit.fullState.
+let synthTimbreStateKey = "synthTimbre"
+
 @objc(SynthAudioUnit)
 public final class SynthAudioUnit: AUAudioUnit {
     private let kernel = SynthKernel()
+    private var timbreValues: [Float] = []
     private var outputBus: AUAudioUnitBus!
     private var outputBusArray: AUAudioUnitBusArray!
 
@@ -101,9 +105,30 @@ public final class SynthAudioUnit: AUAudioUnit {
     /// Loads a neural-source timbre (harmonic amplitudes, fundamental first) and
     /// sets Source Mix to 1 so it is heard. Call from the main thread, not the audio thread.
     public func loadTimbre(_ harmonics: [Float]) {
+        timbreValues = harmonics
         kernel.setTimbre(harmonics)
         let address = AUParameterAddress(Int(SYNTH_PARAM_SOURCE_MIX))
         parameterTree?.parameter(withAddress: address)?.value = 1
+    }
+
+    /// The timbre travels in the unit's full state, the standard AUv3 channel
+    /// for settings. Hosts set it through AUAudioUnit, so they never need to
+    /// cast to this class (the host's copy and the extension's copy differ).
+    /// It is also saved with presets.
+    public override var fullState: [String: Any]? {
+        get {
+            var state = super.fullState ?? [:]
+            if !timbreValues.isEmpty {
+                state[synthTimbreStateKey] = timbreValues.map { Double($0) }
+            }
+            return state
+        }
+        set {
+            super.fullState = newValue
+            let stored = (newValue?[synthTimbreStateKey] as? [Double]) ?? []
+            timbreValues = stored.map { Float($0) }
+            kernel.setTimbre(timbreValues)  // an empty list clears the timbre
+        }
     }
 
     public override var outputBusses: AUAudioUnitBusArray { outputBusArray }

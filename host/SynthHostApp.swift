@@ -20,6 +20,7 @@ final class AudioHost: ObservableObject {
     let model = SynthModel()
     private let engine = AVAudioEngine()
     private var unit: AVAudioUnit?
+    private var pendingTimbre: (name: String, values: [Float])?
 
     func start() async {
         guard unit == nil else { return }
@@ -66,6 +67,10 @@ final class AudioHost: ObservableObject {
             let rate = engine.outputNode.outputFormat(forBus: 0).sampleRate
             model.status = "ONLINE · \(Int(rate)) Hz"
             NSLog("SynthRL audio running at %f Hz", rate)
+            if let pending = pendingTimbre {
+                pendingTimbre = nil
+                apply(timbre: pending.values, name: pending.name)
+            }
         } catch {
             let e = error as NSError
             NSLog("SynthRL audio start failed: domain=%@ code=%d %@", e.domain, e.code, "\(e)")
@@ -90,16 +95,34 @@ final class AudioHost: ObservableObject {
                 throw NSError(domain: "SynthRL", code: 1,
                               userInfo: [NSLocalizedDescriptionKey: "not a synth-timbre file"])
             }
-            guard let synth = unit?.auAudioUnit as? SynthAudioUnit else {
-                throw NSError(domain: "SynthRL", code: 2,
-                              userInfo: [NSLocalizedDescriptionKey: "audio is not running yet"])
+            // Audio may still be starting (the unit is created asynchronously).
+            // Keep the timbre and apply it as soon as audio is running.
+            guard unit != nil else {
+                pendingTimbre = (url.lastPathComponent, values.map { Float($0) })
+                model.status = "TIMBRE · waiting for audio: \(url.lastPathComponent)"
+                return
             }
-            synth.loadTimbre(values.map { Float($0) })
-            model.params[Int(SYNTH_PARAM_SOURCE_MIX)] = 1
-            model.status = "TIMBRE · \(url.lastPathComponent)"
+            apply(timbre: values.map { Float($0) }, name: url.lastPathComponent)
         } catch {
             model.status = "TIMBRE ERROR · \(error.localizedDescription)"
         }
+    }
+
+    /// Pushes a timbre into the running unit and makes it audible.
+    private func apply(timbre: [Float], name: String) {
+        guard let au = unit?.auAudioUnit else {
+            model.status = "TIMBRE ERROR · audio is not running"
+            return
+        }
+        // Go through AUAudioUnit's full state rather than casting to SynthAudioUnit:
+        // the unit's class comes from the bundled extension, not from this app.
+        var state = au.fullState ?? [:]
+        state[synthTimbreStateKey] = timbre.map { Double($0) }
+        au.fullState = state
+        let source = Int(SYNTH_PARAM_SOURCE_MIX)
+        au.parameterTree?.parameter(withAddress: AUParameterAddress(source))?.value = 1
+        model.params[source] = 1
+        model.status = "TIMBRE · \(name)"
     }
 }
 

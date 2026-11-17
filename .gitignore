@@ -20,3 +20,10 @@ DerivedData/
 # Python bytecode and pytest cache
 __pycache__/
 .pytest_cache/
+
+# Datasets (large, downloaded locally)
+/data/
+
+# Model checkpoints (large, local only)
+*.pt
+*.pth
