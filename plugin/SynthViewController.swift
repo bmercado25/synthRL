@@ -22,7 +22,7 @@ public final class SynthAudioUnitViewController: AUViewController, AUAudioUnitFa
 
     public override func loadView() {
         let size = NSSize(width: 980, height: 600)
-        let hosting = NSHostingView(rootView: ContentView(model: model, computerKeyboard: false, showScope: false))
+        let hosting = NSHostingView(rootView: ContentView(model: model, computerKeyboard: false, showScope: false, showOctave: false))
         hosting.frame = NSRect(origin: .zero, size: size)
         view = hosting
         preferredContentSize = size

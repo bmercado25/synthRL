@@ -239,6 +239,20 @@ do {
     let stateHz = Double(stateCrossings) * sampleRate / Double(stateOut.count)
     check(abs(stateHz - 440) < 4.4, "timbre set through fullState plays A4 at 440 Hz (got \(String(format: "%.1f", stateHz)))")
 
+    // A loudness envelope travels with the timbre in fullState and shapes the note.
+    let (engineE, hostE) = try makeHost()
+    var envState = hostE.auAudioUnit.fullState ?? [:]
+    envState["synthTimbre"] = [1.0] as [Double]
+    envState["synthTimbreEnvelope"] = [0.0, 1.0] as [Double]  // rises over the 4 s note
+    hostE.auAudioUnit.fullState = envState
+    hostE.auAudioUnit.parameterTree?.parameter(withAddress: 23)?.value = 1
+    _ = sendMIDI(hostE, 0x90, 69, 127)
+    let envOut = try render(engineE, seconds: 4.0)[0]
+    let eighth = envOut.count / 8
+    let earlyRMS = rms(Array(envOut[0..<eighth]))
+    let lateRMS = rms(Array(envOut[(envOut.count - eighth)...]))
+    check(lateRMS > 4 * earlyRMS, "a rising envelope through fullState makes the late note louder")
+
     let out = CommandLine.arguments.count > 1 ? CommandLine.arguments[1] : "build/au_output.wav"
     try writeWAV(tone, to: out)
     print("  wrote \(out)")

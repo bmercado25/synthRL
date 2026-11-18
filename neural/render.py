@@ -34,3 +34,13 @@ def render_note(harmonics, midi, velocity, seconds, sample_rate=44100):
     if peak > 0:
         out /= peak
     return (MASTER_AMPLITUDE * (velocity / 127.0)) * out
+
+
+def render_export(harmonics, envelope, midi, velocity, seconds, sample_rate=44100):
+    """render_note with a loudness envelope over the note (linear between points,
+    held at the last point), as the core applies it to the neural source."""
+    y = render_note(harmonics, midi, velocity, seconds, sample_rate)
+    env = np.asarray(envelope, dtype=np.float64)
+    t = np.linspace(0.0, 1.0, len(y))
+    level = np.interp(t, np.linspace(0.0, 1.0, len(env)), env) if len(env) > 1 else env[0]
+    return y * level

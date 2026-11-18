@@ -39,6 +39,12 @@ final class SynthModel: ObservableObject {
     /// Notes whose keys are currently down (mouse, computer keyboard or MIDI).
     @Published var heldNotes: Set<Int> = []
     @Published var velocity: Double = 100
+    /// Transposition in octaves for the on-screen and computer keys. Only the
+    /// standalone app shows the control; the plug-in always stays at 0.
+    @Published var octave = 0
+    /// The MIDI note each held key actually sent, so its release matches even if
+    /// the octave changes while the key is down.
+    private var sounding: [Int: Int] = [:]
     /// Parameter values, indexed by the core's parameter index (its AU address).
     @Published var params: [Float] = (0..<Int(synth_param_count())).map {
         synth_param_info(Int32($0)).defaultValue
@@ -55,10 +61,13 @@ final class SynthModel: ObservableObject {
         sendParam?(index, value)
     }
 
+    /// `note` is the key's position (C4 to C5); the octave shift is applied here.
     func noteOn(_ note: Int) {
         guard !heldNotes.contains(note) else { return }
         heldNotes.insert(note)
-        sendMIDI?([0x90, UInt8(note), UInt8(velocity)])
+        let played = min(max(note + 12 * octave, 0), 127)
+        sounding[note] = played
+        sendMIDI?([0x90, UInt8(played), UInt8(velocity)])
     }
 
     /// Only releases the note if it is still the one we started, so a fast
@@ -66,7 +75,8 @@ final class SynthModel: ObservableObject {
     func noteOff(_ note: Int) {
         guard heldNotes.contains(note) else { return }
         heldNotes.remove(note)
-        sendMIDI?([0x80, UInt8(note), 0])
+        let played = sounding.removeValue(forKey: note) ?? note
+        sendMIDI?([0x80, UInt8(played), 0])
     }
 }
 
@@ -321,7 +331,7 @@ struct KeyboardView: View {
         return RoundedRectangle(cornerRadius: 4)
             .fill(fill)
             .overlay(alignment: .bottom) {
-                Text(noteName(note).lowercased())
+                Text(noteName(note + 12 * model.octave).lowercased())
                     .font(Theme.font(9))
                     .foregroundStyle(isBlack && !pressed ? Theme.dim : Color.black.opacity(0.5))
                     .padding(5)
@@ -373,6 +383,8 @@ struct ContentView: View {
     var computerKeyboard = true
     /// The standalone app shows the live scope; the plug-in window hides it.
     var showScope = true
+    /// The standalone app shows the octave control; the plug-in window hides it.
+    var showOctave = true
 
     private var waveNames: [String] {
         (0..<Int(synth_waveform_count())).map { String(cString: synth_waveform_name(Int32($0))).lowercased() }
@@ -513,6 +525,20 @@ struct ContentView: View {
                 Text("\(Int(model.velocity))")
                     .font(Theme.font(10, .medium))
                     .frame(width: 24, alignment: .trailing)
+            }
+            if showOctave {
+                HStack(spacing: 6) {
+                    Text("octave")
+                        .font(Theme.font(10))
+                        .foregroundStyle(Theme.dim)
+                    Button("−") { model.octave = max(model.octave - 1, -3) }
+                        .disabled(model.octave <= -3)
+                    Text(model.octave > 0 ? "+\(model.octave)" : "\(model.octave)")
+                        .font(Theme.font(10, .medium))
+                        .frame(width: 24)
+                    Button("+") { model.octave = min(model.octave + 1, 3) }
+                        .disabled(model.octave >= 3)
+                }
             }
             Text(model.heldNotes.isEmpty
                  ? "idle"

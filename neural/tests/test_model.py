@@ -76,10 +76,107 @@ def test_pitch_check_reads_a_sine_correctly():
     assert abs(cents) < 5
 
 
+def _have_splits():
+    needed = ["train", "valid"]
+    return all((data.split_dir(s) / "examples.json").exists() for s in needed)
+
+
 def test_training_smoke_run(tmp_path):
-    if not (data.ROOT / "valid" / "nsynth-valid" / "examples.json").exists():
-        pytest.skip("NSynth valid split not downloaded (see CLAUDE.md)")
+    if not _have_splits():
+        pytest.skip("NSynth train and valid splits not downloaded (see CLAUDE.md)")
     from neural.train import train
     out = tmp_path / "smoke.pt"
-    train(steps=2, batch=2, lr=1e-3, out=out, seed=0, log_every=1, eval_every=2)
+    train(steps=2, batch=2, lr=1e-3, out=out, seed=0, log_every=1, eval_every=2,
+          resume=False)
     assert out.exists()
+
+
+def test_training_resumes_from_last_checkpoint(tmp_path):
+    if not _have_splits():
+        pytest.skip("NSynth train and valid splits not downloaded (see CLAUDE.md)")
+    from neural.train import last_path, train
+    out = tmp_path / "resume.pt"
+    train(steps=2, batch=2, lr=1e-3, out=out, seed=0, log_every=1, eval_every=2,
+          resume=False)
+    first = torch.load(last_path(out), map_location="cpu")
+    assert first["step"] == 2
+    # Resuming to 4 steps must continue from step 2, not start over.
+    train(steps=4, batch=2, lr=1e-3, out=out, seed=0, log_every=1, eval_every=2,
+          resume=True)
+    second = torch.load(last_path(out), map_location="cpu")
+    assert second["step"] == 4
+
+
+def test_timbre_envelope_round_trip_and_v1_still_reads(tmp_path):
+    from neural.timbre import read_envelope
+    profile = np.zeros(N_HARM, dtype=np.float32)
+    profile[0] = 1.0
+    env = np.linspace(0.0, 1.0, 64, dtype=np.float32)
+    path = tmp_path / "v2.json"
+    write_timbre(path, profile, f0_hz=261.6, source_name="sine", envelope=env)
+    assert np.allclose(read_envelope(path), env, atol=1e-6)
+    assert np.allclose(read_timbre(path), profile, atol=1e-6)
+
+    # A version 1 file (no envelope) still reads, and reports no envelope.
+    v1 = tmp_path / "v1.json"
+    write_timbre(v1, profile, f0_hz=261.6, source_name="sine")
+    assert read_envelope(v1) is None
+    assert np.allclose(read_timbre(v1), profile, atol=1e-6)
+
+
+def test_envelope_rejects_too_many_points(tmp_path):
+    profile = np.zeros(N_HARM, dtype=np.float32)
+    profile[0] = 1.0
+    with pytest.raises(ValueError):
+        write_timbre(tmp_path / "bad.json", profile, f0_hz=261.6, source_name="x",
+                     envelope=np.ones(65, dtype=np.float32))
+
+
+def test_any_sound_exports_without_a_pitch(tmp_path):
+    from neural.model import ENV_POINTS, export_from_model, fit_to_note
+    from neural.timbre import read_envelope
+    torch.manual_seed(2)
+    model = NeuralSource().eval()
+    rng = np.random.default_rng(3)
+    clips = {
+        "noise": (0.3 * rng.standard_normal(SR * 2)).astype(np.float32),
+        "click": np.zeros(SR // 10, dtype=np.float32),
+        "long": (0.3 * rng.standard_normal(SR * 30)).astype(np.float32),
+    }
+    clips["click"][10] = 0.9
+    for name, wave in clips.items():
+        harmonics, envelope = export_from_model(model, fit_to_note(wave))
+        assert harmonics.shape == (N_HARM,), name
+        assert np.isfinite(harmonics).all(), name
+        assert float(harmonics.max()) == pytest.approx(1.0), name
+        assert envelope.shape == (ENV_POINTS,), name
+        path = tmp_path / f"{name}.json"
+        write_timbre(path, harmonics, f0_hz=None, source_name=name, envelope=envelope)
+        assert np.allclose(read_timbre(path), harmonics, atol=1e-6), name
+        assert np.allclose(read_envelope(path), envelope, atol=1e-6), name
+
+
+def test_fit_to_note_pads_short_and_picks_loudest_window():
+    from neural.model import NOTE_SECONDS, fit_to_note
+    n = int(SR * NOTE_SECONDS)
+    short = fit_to_note(np.full(SR, 0.5, dtype=np.float32))
+    assert short.shape == (n,) and short[SR:].max() == 0.0
+    # A loud burst at 20 s should win over the quiet start of a 30 s clip.
+    long = np.full(SR * 30, 0.01, dtype=np.float32)
+    long[SR * 20:SR * 20 + SR] = 0.8
+    fitted = fit_to_note(long)
+    assert fitted.shape == (n,) and fitted.max() == pytest.approx(0.8)
+
+
+def test_silence_is_rejected():
+    from neural.model import fit_to_note
+    with pytest.raises(ValueError):
+        fit_to_note(np.zeros(SR, dtype=np.float32))
+
+
+def test_null_f0_round_trips(tmp_path):
+    profile = np.zeros(N_HARM, dtype=np.float32)
+    profile[0] = 1.0
+    path = tmp_path / "unpitched.json"
+    write_timbre(path, profile, f0_hz=None, source_name="noise")
+    assert np.allclose(read_timbre(path), profile, atol=1e-6)

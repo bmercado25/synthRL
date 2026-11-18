@@ -110,6 +110,16 @@ void synth_render(SynthCore* core, float* out, int frames);
 #define SYNTH_TIMBRE_MAX_HARMONICS 64
 void synth_set_timbre(SynthCore* core, const float* harmonics, int count);
 
+// Sets the timbre together with a loudness envelope for the neural source. The
+// envelope gives the level at `envCount` points spread evenly over
+// SYNTH_TIMBRE_ENV_SECONDS from note-on, linearly interpolated, and held at the
+// last point after that. The harmonics and envelope are published in one step.
+// envCount 0 means no envelope (full level). Off the audio thread.
+#define SYNTH_TIMBRE_MAX_ENV_POINTS 64
+#define SYNTH_TIMBRE_ENV_SECONDS 4.0
+void synth_set_timbre_shaped(SynthCore* core, const float* harmonics, int count,
+                             const float* envelope, int envCount);
+
 #ifdef __cplusplus
 }
 #endif

@@ -1,11 +1,17 @@
-"""Step 2b training: cross-pitch reconstruction on NSynth.
+"""Step 2b training: cross-pitch reconstruction on the NSynth train split.
 
-    .venv/bin/python -m neural.train --steps 4000
+    .venv/bin/python -m neural.train --steps 40000
 
 Each step samples (source, target) notes from one training instrument and
 trains the model to rebuild the target from the source, at the target's pitch
-and velocity. Validation uses fixed pairs from held-out training instruments.
-The best checkpoint by validation loss is kept.
+and velocity. Validation uses fixed pairs from the NSynth valid split.
+
+Two checkpoints are written:
+  <out>            the best validation loss so far (what neural.evaluate loads)
+  <out>_last.pt    the latest state, with optimizer and scheduler, for --resume
+
+The per-step pair sampling and noise seed depend only on the step number, so a
+resumed run draws the same batches it would have drawn without the interruption.
 """
 
 import argparse
@@ -17,7 +23,7 @@ import torch
 from . import data
 from .model import NeuralSource, mr_stft_loss
 
-DEFAULT_OUT = data.ROOT.parent / "checkpoints" / "nsynth_2b.pt"
+DEFAULT_OUT = data.ROOT.parent / "checkpoints" / "nsynth_2b_full.pt"
 
 
 def pick_device():
@@ -46,23 +52,40 @@ def validate(model, device, val_pairs, batch=8):
     return total / count
 
 
-def train(steps, batch, lr, out, seed, log_every, eval_every):
+def last_path(out):
+    return out.with_name(out.stem + "_last.pt")
+
+
+def train(steps, batch, lr, out, seed, log_every, eval_every, resume):
     torch.manual_seed(seed)
     device = pick_device()
-    train_notes, val_notes = data.split_instruments(data.load_split("valid"), seed=seed)
-    val_pairs = data.sample_pairs(val_notes, count=128, seed=1234)
-    print(f"device {device}: {len(train_notes)} train notes, {len(val_notes)} validation notes, "
-          f"{len({n.instrument for n in train_notes})} train instruments", flush=True)
+    sampler = data.PairSampler(data.load_split("train"))
+    val_pairs = data.sample_pairs(data.load_split("valid"), count=128, seed=1234)
+    print(f"device {device}: {len(sampler.groups)} training instruments, "
+          f"{len(val_pairs)} validation pairs", flush=True)
 
     model = NeuralSource().to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=lr)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=steps)
-    best = float("inf")
+    start_step, best = 0, float("inf")
     out.parent.mkdir(parents=True, exist_ok=True)
-    start = time.time()
 
-    for step in range(1, steps + 1):
-        pairs = data.sample_pairs(train_notes, count=batch, seed=seed * 1_000_003 + step)
+    if resume and last_path(out).exists():
+        ck = torch.load(last_path(out), map_location=device)
+        model.load_state_dict(ck["model"])
+        opt.load_state_dict(ck["opt"])
+        sched.load_state_dict(ck["sched"])
+        start_step, best = ck["step"], ck["best"]
+        print(f"resumed from step {start_step} (best validation {best:.4f})", flush=True)
+
+    def save_last(step):
+        torch.save({"model": model.state_dict(), "opt": opt.state_dict(),
+                    "sched": sched.state_dict(), "step": step, "best": best,
+                    "seed": seed}, last_path(out))
+
+    start = time.time()
+    for step in range(start_step + 1, steps + 1):
+        pairs = sampler.sample(count=batch, seed=seed * 1_000_003 + step)
         src, tgt, midi, vel = to_tensors(device, *data.batch_from_pairs(pairs))
         z = model.encode(src)
         pred = model.render(z, midi, vel, noise_seed=step)
@@ -74,32 +97,39 @@ def train(steps, batch, lr, out, seed, log_every, eval_every):
         sched.step()
 
         if step % log_every == 0:
-            rate = step / (time.time() - start)
-            print(f"step {step:5d}  train {loss.item():.4f}  ({rate:.2f} steps/s)", flush=True)
+            rate = (step - start_step) / (time.time() - start)
+            print(f"step {step:6d}  train {loss.item():.4f}  ({rate:.2f} steps/s)", flush=True)
         if step % eval_every == 0 or step == steps:
             val = validate(model, device, val_pairs)
-            print(f"step {step:5d}  validation {val:.4f}", flush=True)
+            print(f"step {step:6d}  validation {val:.4f}", flush=True)
             if val < best:
                 best = val
                 torch.save({"model": model.state_dict(), "step": step,
                             "validation": val, "seed": seed}, out)
                 print(f"           saved best -> {out}", flush=True)
+            save_last(step)
 
+    if start_step >= steps:
+        print("already trained to the requested step count", flush=True)
     print(f"done. best validation {best:.4f}", flush=True)
     return out
 
 
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument("--steps", type=int, default=4000)
-    p.add_argument("--batch", type=int, default=8)
+    # Measured on this Mac (MPS): batch 8 about 7.6 steps/s, batch 16 about 5.2 steps/s.
+    p.add_argument("--steps", type=int, default=60000)
+    p.add_argument("--batch", type=int, default=16)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--out", type=Path, default=DEFAULT_OUT)
     p.add_argument("--log-every", type=int, default=50)
     p.add_argument("--eval-every", type=int, default=500)
+    p.add_argument("--resume", action="store_true",
+                   help="continue from <out>_last.pt if it exists")
     args = p.parse_args(argv)
-    train(args.steps, args.batch, args.lr, args.out, args.seed, args.log_every, args.eval_every)
+    train(args.steps, args.batch, args.lr, args.out, args.seed,
+          args.log_every, args.eval_every, args.resume)
 
 
 if __name__ == "__main__":

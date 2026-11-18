@@ -28,10 +28,14 @@ final class SynthKernel {
         synth_set_param(core, Int32(index), value)
     }
 
-    /// Builds the neural-source wavetables. Not real-time safe: call off the audio thread.
-    func setTimbre(_ harmonics: [Float]) {
-        harmonics.withUnsafeBufferPointer { buffer in
-            synth_set_timbre(core, buffer.baseAddress, Int32(buffer.count))
+    /// Builds the neural-source wavetables and loudness envelope in one step.
+    /// An empty envelope means full level. Not real-time safe: call off the audio thread.
+    func setTimbre(_ harmonics: [Float], envelope: [Float]) {
+        harmonics.withUnsafeBufferPointer { h in
+            envelope.withUnsafeBufferPointer { e in
+                synth_set_timbre_shaped(core, h.baseAddress, Int32(h.count),
+                                        e.baseAddress, Int32(e.count))
+            }
         }
     }
 
@@ -72,13 +76,15 @@ func makeSynthParameters() -> [AUParameter] {
     }
 }
 
-/// Key under which the timbre is stored in AUAudioUnit.fullState.
+/// Keys under which the timbre and its loudness envelope are stored in AUAudioUnit.fullState.
 let synthTimbreStateKey = "synthTimbre"
+let synthTimbreEnvelopeStateKey = "synthTimbreEnvelope"
 
 @objc(SynthAudioUnit)
 public final class SynthAudioUnit: AUAudioUnit {
     private let kernel = SynthKernel()
     private var timbreValues: [Float] = []
+    private var timbreEnvelope: [Float] = []
     private var outputBus: AUAudioUnitBus!
     private var outputBusArray: AUAudioUnitBusArray!
 
@@ -102,11 +108,13 @@ public final class SynthAudioUnit: AUAudioUnit {
         }
     }
 
-    /// Loads a neural-source timbre (harmonic amplitudes, fundamental first) and
-    /// sets Source Mix to 1 so it is heard. Call from the main thread, not the audio thread.
-    public func loadTimbre(_ harmonics: [Float]) {
+    /// Loads a neural-source timbre (harmonic amplitudes, fundamental first), with an
+    /// optional loudness envelope over the note, and sets Source Mix to 1 so it is
+    /// heard. Call from the main thread, not the audio thread.
+    public func loadTimbre(_ harmonics: [Float], envelope: [Float] = []) {
         timbreValues = harmonics
-        kernel.setTimbre(harmonics)
+        timbreEnvelope = envelope
+        kernel.setTimbre(harmonics, envelope: envelope)
         let address = AUParameterAddress(Int(SYNTH_PARAM_SOURCE_MIX))
         parameterTree?.parameter(withAddress: address)?.value = 1
     }
@@ -120,14 +128,20 @@ public final class SynthAudioUnit: AUAudioUnit {
             var state = super.fullState ?? [:]
             if !timbreValues.isEmpty {
                 state[synthTimbreStateKey] = timbreValues.map { Double($0) }
+                if !timbreEnvelope.isEmpty {
+                    state[synthTimbreEnvelopeStateKey] = timbreEnvelope.map { Double($0) }
+                }
             }
             return state
         }
         set {
             super.fullState = newValue
             let stored = (newValue?[synthTimbreStateKey] as? [Double]) ?? []
+            let storedEnvelope = (newValue?[synthTimbreEnvelopeStateKey] as? [Double]) ?? []
             timbreValues = stored.map { Float($0) }
-            kernel.setTimbre(timbreValues)  // an empty list clears the timbre
+            timbreEnvelope = storedEnvelope.map { Float($0) }
+            // An empty harmonic list clears the timbre (and its envelope with it).
+            kernel.setTimbre(timbreValues, envelope: timbreValues.isEmpty ? [] : timbreEnvelope)
         }
     }
 
