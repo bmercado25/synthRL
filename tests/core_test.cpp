@@ -548,6 +548,38 @@ int main() {
         }
     }
 
+    std::printf("Neural source: loudness envelope shapes the note\n");
+    {
+        // A sine rising from silence to full level over the 4 s note.
+        const float sine[1] = {1.0f};
+        const float rise[2] = {0.0f, 1.0f};
+        SynthCore* s = synth_create(kSR);
+        synth_set_timbre_shaped(s, sine, 1, rise, 2);
+        synth_set_param(s, SYNTH_PARAM_SOURCE_MIX, 1.0f);
+        synth_note_on(s, 69, 127);
+        std::vector<float> out(4 * kSecond);
+        synth_render(s, out.data(), 4 * kSecond);
+        synth_destroy(s);
+        auto peakOf = [&](int from, int to) {
+            float p = 0.0f;
+            for (int i = from; i < to; ++i) p = std::fmax(p, std::fabs(out[i]));
+            return p;
+        };
+        const float early = peakOf(0, kSecond / 2);
+        const float late = peakOf(7 * kSecond / 2, 4 * kSecond);
+        CHECK(late > 4.0f * early, "envelope rising 0 to 1 makes the late note much louder");
+
+        // The same timbre without an envelope stays at full level from the start.
+        s = synth_create(kSR);
+        synth_set_timbre(s, sine, 1);
+        synth_set_param(s, SYNTH_PARAM_SOURCE_MIX, 1.0f);
+        synth_note_on(s, 69, 127);
+        synth_render(s, out.data(), 4 * kSecond);
+        synth_destroy(s);
+        CHECK(peakOf(0, kSecond / 2) > 0.5f * peakOf(7 * kSecond / 2, 4 * kSecond),
+              "a timbre loaded without an envelope has no level change");
+    }
+
     std::printf("Neural source: clearing and sample-rate change\n");
     {
         const float sine[1] = {1.0f};

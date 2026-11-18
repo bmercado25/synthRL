@@ -277,7 +277,33 @@ struct TimbreSet {
     float harmonics[SYNTH_TIMBRE_MAX_HARMONICS] = {};
     // One extra sample per table so linear interpolation can wrap without a branch.
     float tables[kWaveBands][kWaveTableSize + 1] = {};
+    // Loudness over the note (see synth_set_timbre_shaped). envCount 0 = no envelope.
+    float envelope[SYNTH_TIMBRE_MAX_ENV_POINTS] = {};
+    int envCount = 0;
 };
+
+// Copies an envelope into `set`. A null or empty envelope clears it.
+void set_envelope(TimbreSet& set, const float* envelope, int count) {
+    if (!envelope || count <= 0) {
+        set.envCount = 0;
+        return;
+    }
+    if (count > SYNTH_TIMBRE_MAX_ENV_POINTS) count = SYNTH_TIMBRE_MAX_ENV_POINTS;
+    for (int k = 0; k < count; ++k) set.envelope[k] = envelope[k];
+    set.envCount = count;
+}
+
+// Level of the envelope at `t`, where t = 0 is note-on and t = 1 is the end of
+// SYNTH_TIMBRE_ENV_SECONDS. Linear between points, held at the last point after the end.
+double envelope_at(const TimbreSet& set, double t) {
+    const int last = set.envCount - 1;
+    if (t <= 0.0) return set.envelope[0];
+    const double pos = t * last;
+    if (pos >= last) return set.envelope[last];
+    const int i = static_cast<int>(pos);
+    const double frac = pos - i;
+    return set.envelope[i] + frac * (set.envelope[i + 1] - set.envelope[i]);
+}
 
 // Builds all bands from `harmonics` into `set`, at sample rate `sr`.
 // Allocates nothing: the storage lives inside TimbreSet.
@@ -345,6 +371,7 @@ struct Voice {
     Oscillator oscA;
     Oscillator oscB;
     double tablePhase = 0.0;         // neural source phase, cycles [0,1)
+    double envSamples = 0.0;         // samples since note-on, for the timbre envelope
     SvfLowpass filter;
     Envelope ampEnv;
     Envelope filterEnv;
@@ -458,13 +485,15 @@ void synth_set_sample_rate(SynthCore* core, double sample_rate) {
     const int front = core->timbreFront.load(std::memory_order_acquire);
     if (front >= 0) {
         const int back = 1 - front;
-        build_timbre(core->timbreSets[back], core->timbreSets[front].harmonics,
-                     SYNTH_TIMBRE_MAX_HARMONICS, sample_rate);
+        const TimbreSet& old = core->timbreSets[front];
+        build_timbre(core->timbreSets[back], old.harmonics, SYNTH_TIMBRE_MAX_HARMONICS, sample_rate);
+        set_envelope(core->timbreSets[back], old.envelope, old.envCount);
         core->timbreFront.store(back, std::memory_order_release);
     }
 }
 
-void synth_set_timbre(SynthCore* core, const float* harmonics, int count) {
+void synth_set_timbre_shaped(SynthCore* core, const float* harmonics, int count,
+                             const float* envelope, int envCount) {
     if (!core) return;
     if (count <= 0 || !harmonics) {
         core->timbreFront.store(-1, std::memory_order_release);
@@ -474,7 +503,12 @@ void synth_set_timbre(SynthCore* core, const float* harmonics, int count) {
     const int front = core->timbreFront.load(std::memory_order_acquire);
     const int back = front == 0 ? 1 : 0;
     build_timbre(core->timbreSets[back], harmonics, count, core->sampleRate);
+    set_envelope(core->timbreSets[back], envelope, envCount);
     core->timbreFront.store(back, std::memory_order_release);
+}
+
+void synth_set_timbre(SynthCore* core, const float* harmonics, int count) {
+    synth_set_timbre_shaped(core, harmonics, count, nullptr, 0);
 }
 
 void synth_note_on(SynthCore* core, int note, int velocity) {
@@ -508,6 +542,7 @@ void synth_note_on(SynthCore* core, int note, int velocity) {
     chosen->oscA.phase = 0.0;
     chosen->oscB.phase = 0.0;
     chosen->tablePhase = 0.0;
+    chosen->envSamples = 0.0;
     chosen->filter = SvfLowpass();
     chosen->velocityGain = kMasterAmplitude * (velocity / 127.0);
     chosen->ampEnv.noteOn();
@@ -593,8 +628,13 @@ void synth_render(SynthCore* core, float* out, int frames) {
             // Neural source follows osc A's pitch, including detune and vibrato.
             double raw = (1.0 - sourceMix) * oscMix;
             if (sourceMix > 0.0 && timbre) {
-                raw += sourceMix * read_timbre(*timbre, cpsA * sr, cpsA, v.tablePhase);
+                double gain = 1.0;
+                if (timbre->envCount > 0) {
+                    gain = envelope_at(*timbre, v.envSamples / (SYNTH_TIMBRE_ENV_SECONDS * sr));
+                }
+                raw += sourceMix * gain * read_timbre(*timbre, cpsA * sr, cpsA, v.tablePhase);
             }
+            v.envSamples += 1.0;
 
             // Filter: base cutoff, opened by this voice's envelope and moved by the LFO.
             double cutoff = baseCutoffHz *

@@ -146,8 +146,21 @@ class NeuralSource(nn.Module):
         return synthesize(dist, loud, noise, midi, n_samples, noise_seed)
 
 
-def timbre_from_model(model, wave_16k):
-    """Pitch-independent 64-harmonic timbre (peak 1) for the plugin's timbre file."""
+ENV_POINTS = 64  # matches SYNTH_TIMBRE_MAX_ENV_POINTS in core/synth_core.h
+
+
+def export_from_model(model, wave_16k):
+    """Pitch-independent timbre for the plugin, from one source note.
+
+    Returns (harmonics, envelope):
+      harmonics  64 harmonic amplitudes (peak 1): the loudness-weighted average
+                 of the decoder's per-frame harmonic shape.
+      envelope   ENV_POINTS loudness levels (peak 1) spread over the note. The
+                 plugin applies it to the neural source, so the note's attack,
+                 decay and sustain follow the decoder. Without it the export has
+                 no loudness shape. On the 2b checkpoint, a constant level raised
+                 the STFT loss from about 3.6 to about 13, so this matters most.
+    """
     model.eval()
     with torch.no_grad():
         x = torch.as_tensor(wave_16k, dtype=torch.float32)[None]
@@ -158,5 +171,37 @@ def timbre_from_model(model, wave_16k):
         dist, loud, _ = model.decoder(midi, vel, z, frames)
         w = loud[0] / (loud[0].sum() + 1e-9)                 # loudness-weighted average
         profile = (w[:, None] * dist[0]).sum(dim=0).numpy()
+        level = loud[0].numpy()
     profile = profile / profile.max()
-    return profile.astype(np.float32)
+    envelope = np.interp(np.linspace(0, frames - 1, ENV_POINTS), np.arange(frames), level)
+    envelope = envelope / envelope.max()
+    return profile.astype(np.float32), envelope.astype(np.float32)
+
+
+def fit_to_note(wave_16k):
+    """Any mono clip at SR -> the 4 s array the encoder was trained on.
+
+    Clips longer than NOTE_SECONDS keep their loudest window (chosen by RMS, so
+    a quiet tail does not win). Shorter clips are zero-padded. No pitch is needed.
+    Raises ValueError for empty or silent input.
+    """
+    n = int(SR * NOTE_SECONDS)
+    x = np.asarray(wave_16k, dtype=np.float32)
+    if x.ndim != 1:
+        raise ValueError("expected a mono signal")
+    if x.size == 0 or float(np.abs(x).max()) < 1e-4:
+        raise ValueError("signal is silent")
+    if x.size <= n:
+        return np.pad(x, (0, n - x.size))
+    hop = SR // 4
+    starts = list(range(0, x.size - n + 1, hop))
+    if starts[-1] != x.size - n:
+        starts.append(x.size - n)  # always consider the final window too
+    energy = [float(np.mean(x[s:s + n] ** 2)) for s in starts]
+    best = starts[int(np.argmax(energy))]
+    return x[best:best + n]
+
+
+def timbre_from_model(model, wave_16k):
+    """Pitch-independent 64-harmonic timbre (peak 1), without the envelope."""
+    return export_from_model(model, wave_16k)[0]

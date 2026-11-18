@@ -6,8 +6,11 @@ Each pair is (source note, target note) from one held-out instrument. Every
 method builds the target's pitch and velocity from the source only:
 
   model_full   the decoder at the target pitch and velocity (training objective)
-  model_timbre the pitch-independent timbre the plugin would load, rendered
-               at the target pitch with the reference renderer
+  model_export the pitch-independent timbre plus loudness envelope the plugin
+               would load (timbre format v2), rendered at the target pitch
+               with the reference renderer
+  model_timbre the same harmonic timbre without the envelope (format v1), to
+               show what the envelope adds
   analysis_2a  the step 2a analysis timbre, rendered the same way
   mean_timbre  the average 2a timbre over training instruments (no source info)
   repitch      the source note shifted to the target pitch (no model)
@@ -29,9 +32,8 @@ import torch
 
 from . import data
 from .analyze import analyze
-from .model import (NOTE_SECONDS, SR, NeuralSource, mr_stft_loss,
-                    timbre_from_model)
-from .render import render_note
+from .model import (NOTE_SECONDS, SR, NeuralSource, export_from_model, mr_stft_loss)
+from .render import render_export, render_note
 
 OUT_DIR = Path(__file__).resolve().parent.parent / "build" / "neural"
 N_SAMPLES = int(SR * NOTE_SECONDS)
@@ -90,11 +92,12 @@ def method_outputs(model, mean_profile, src_wave, src_note, tgt):
     with torch.no_grad():
         z = model.encode(torch.as_tensor(src_wave, dtype=torch.float32)[None])
         full = model.render(z, midi, vel, noise_seed=0)[0].numpy()
-    timbre = timbre_from_model(model, src_wave)
+    timbre, envelope = export_from_model(model, src_wave)
     shifted = librosa.effects.pitch_shift(src_wave, sr=SR, n_steps=tgt.pitch - src_note.pitch)
     shifted = np.pad(shifted, (0, max(0, N_SAMPLES - len(shifted))))[:N_SAMPLES]
     out = {
         "model_full": full,
+        "model_export": render_export(timbre, envelope, tgt.pitch, tgt.velocity, NOTE_SECONDS, SR),
         "model_timbre": render_note(timbre, tgt.pitch, tgt.velocity, NOTE_SECONDS, SR),
         "mean_timbre": render_note(mean_profile, tgt.pitch, tgt.velocity, NOTE_SECONDS, SR),
         "repitch": shifted,
@@ -161,7 +164,7 @@ def main(argv=None):
 
     torch.set_num_threads(max(1, torch.get_num_threads()))
     model, ckpt = load_model(args.checkpoint)
-    train_notes, _ = data.split_instruments(data.load_split("valid"), seed=ckpt.get("seed", 0))
+    train_notes = data.load_split("train")  # only used for the mean-timbre baseline
     test_notes = data.load_split("test")
     pairs = data.sample_pairs(test_notes, count=args.pairs, seed=99)
     print(f"checkpoint step {ckpt['step']} (validation {ckpt['validation']:.4f}); "
@@ -169,7 +172,8 @@ def main(argv=None):
 
     mean_profile = mean_training_timbre(train_notes)
     results = {m: {"loss": [], "pitch": []} for m in
-               ["model_full", "model_timbre", "analysis_2a", "mean_timbre", "repitch"]}
+               ["model_full", "model_export", "model_timbre", "analysis_2a", "mean_timbre",
+                "repitch"]}
     failures = 0
     listen_dir = OUT_DIR / "listen"
     listen_dir.mkdir(parents=True, exist_ok=True)
