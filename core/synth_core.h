@@ -39,6 +39,7 @@ enum {
     SYNTH_PARAM_DRIVE,             // 0-1: soft-clip drive (0 = clean)
     SYNTH_PARAM_REVERB_MIX,        // 0-1: dry/wet
     SYNTH_PARAM_REVERB_SIZE,       // 0-1: room size (decay time)
+    SYNTH_PARAM_SOURCE_MIX,        // 0-1: 0 = oscillators, 1 = neural source (timbre from synth_set_timbre)
     SYNTH_PARAM_COUNT
 };
 
@@ -99,6 +100,15 @@ void synth_note_off(SynthCore* core, int note);
 
 // Renders `frames` mono samples into `out`. No allocation, no locks.
 void synth_render(SynthCore* core, float* out, int frames);
+
+// ---- Neural source (timbre) ------------------------------------------------
+// Sets the harmonic amplitudes of the neural source: harmonics[0] is the
+// fundamental, harmonics[k-1] is harmonic k. Up to SYNTH_TIMBRE_MAX_HARMONICS
+// values are used; count 0 clears the timbre. Builds bandlimited wavetables,
+// so call it off the audio thread. Only one thread may call it at a time.
+// Parameter SYNTH_PARAM_SOURCE_MIX chooses how much of the timbre is heard.
+#define SYNTH_TIMBRE_MAX_HARMONICS 64
+void synth_set_timbre(SynthCore* core, const float* harmonics, int count);
 
 #ifdef __cplusplus
 }

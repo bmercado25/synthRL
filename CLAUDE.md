@@ -106,9 +106,9 @@ Each phase ends with something testable. Do not start a later phase to avoid a f
 ## Open questions
 
 1. Which generator gives the best mix of waveform quality, controllability and inference speed?
-2. Can it play across a wide MIDI range?
+2. Can it play across a wide MIDI range? *Partial (step 0 spike, random-weight DDSP-style harmonic decoder, `spikes/step0_render_speed.py`): all 88 notes (MIDI 21-108) render with the spectral peak within 50 cents of a harmonic of f0. This checks the harmonic path only, not a trained model or perceived pitch.*
 3. Which representations support meaningful latent manipulation?
-4. Is generation fast enough for continuous background exploration?
+4. Is generation fast enough for continuous background exploration? *Partial (same spike): the tiny decoder runs at about 0.001-0.004 of real time per voice on CPU and MPS. That is far below a realistic neural vocoder's cost, so it is an optimistic floor, not a verdict.*
 5. Which RL algorithm works best for continuous synthesis parameters, and does it beat the baselines?
 6. How should human preference feedback be incorporated?
 7. How does exploration stay stable while the user changes parameters?
@@ -122,9 +122,9 @@ Each phase ends with something testable. Do not start a later phase to avoid a f
 - Repository layout: `core/` (portable C++ DSP, `synth_core.h/.cpp`), `plugin/` (AUv3 wrapper, bridging header, Info.plist, entitlements), `ui/` (SwiftUI controls), `host/` (SwiftUI host app), `tests/` (`core_test.cpp`, `au/main.swift`), `scripts/` (build, install, test)
 - Build system: shell scripts over `clang++` and `swiftc` (Command Line Tools, no full Xcode required). `scripts/build.sh` produces `build/SynthHost.app` with the AUv3 extension embedded and ad-hoc signed
 - Minimum OS targets:
-- Parameter schema file location:
+- Parameter schema file location: `schema/synth_params.json`, generated from the core by `tools/export_schema.cpp`. `scripts/test.sh` fails if it is stale
 - Test phrase files location:
-- Python environment:
+- Python environment: Python 3.12 in `.venv/` at the repo root (`uv venv --python 3.12 .venv`), pinned in `spikes/requirements.lock`. PyTorch 2.15 with MPS (Apple GPU) available. The venv is git-ignored
 - Generator model and version:
 
 ## Decision log
@@ -141,3 +141,4 @@ Each phase ends with something testable. Do not start a later phase to avoid a f
 | 2026-11-16 | Shell is AUv3 (Swift AUAudioUnit wrapper, SwiftUI host app) over the portable C++ core; no JUCE, no VST3 for now | Matches the existing project code (core/, plugin/, host/, ui/). Keeps the DSP portable so a VST3 or JUCE shell can be added later without rewriting it |
 | 2026-11-16 | Human feedback is part of the core loop, not a late phase | KEEP, DISCARD, FAVORITE, MORE/LESS LIKE THIS guide exploration from the start |
 | 2026-11-16 | Presets store the recipe, with optional cached audio | Neural regeneration may not be exactly reproducible |
+| 2026-11-16 | Step 2a is analysis-resynthesis (pYIN f0, harmonic timbre, no training); the trained generator comes after the hand-off works | Proves sample import, the core's neural source path and the host loader end to end before model quality is at stake. Known limit: magnitudes only, no phase or noise |

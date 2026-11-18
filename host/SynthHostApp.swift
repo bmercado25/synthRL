@@ -6,6 +6,7 @@ import AudioToolbox
 import AVFAudio
 import Combine
 import SwiftUI
+import UniformTypeIdentifiers
 
 private let synthDescription = AudioComponentDescription(
     componentType: synthComponentType,
@@ -19,6 +20,7 @@ final class AudioHost: ObservableObject {
     let model = SynthModel()
     private let engine = AVAudioEngine()
     private var unit: AVAudioUnit?
+    private var pendingTimbre: (name: String, values: [Float])?
 
     func start() async {
         guard unit == nil else { return }
@@ -65,11 +67,62 @@ final class AudioHost: ObservableObject {
             let rate = engine.outputNode.outputFormat(forBus: 0).sampleRate
             model.status = "ONLINE · \(Int(rate)) Hz"
             NSLog("SynthRL audio running at %f Hz", rate)
+            if let pending = pendingTimbre {
+                pendingTimbre = nil
+                apply(timbre: pending.values, name: pending.name)
+            }
         } catch {
             let e = error as NSError
             NSLog("SynthRL audio start failed: domain=%@ code=%d %@", e.domain, e.code, "\(e)")
             model.status = "ERROR · \(e.localizedDescription) (\(e.code))"
         }
+    }
+
+    /// Opens a timbre file made by `python -m neural.export` and loads it into the
+    /// synth. The host is unsandboxed, so it reads the file itself; the AU only
+    /// receives the parsed harmonics.
+    func loadTimbre() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.json]
+        panel.canChooseDirectories = false
+        panel.message = "Choose a timbre file made by neural.export"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            let data = try Data(contentsOf: url)
+            guard let doc = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  doc["format"] as? String == "synth-timbre",
+                  let values = doc["harmonics"] as? [Double] else {
+                throw NSError(domain: "SynthRL", code: 1,
+                              userInfo: [NSLocalizedDescriptionKey: "not a synth-timbre file"])
+            }
+            // Audio may still be starting (the unit is created asynchronously).
+            // Keep the timbre and apply it as soon as audio is running.
+            guard unit != nil else {
+                pendingTimbre = (url.lastPathComponent, values.map { Float($0) })
+                model.status = "TIMBRE · waiting for audio: \(url.lastPathComponent)"
+                return
+            }
+            apply(timbre: values.map { Float($0) }, name: url.lastPathComponent)
+        } catch {
+            model.status = "TIMBRE ERROR · \(error.localizedDescription)"
+        }
+    }
+
+    /// Pushes a timbre into the running unit and makes it audible.
+    private func apply(timbre: [Float], name: String) {
+        guard let au = unit?.auAudioUnit else {
+            model.status = "TIMBRE ERROR · audio is not running"
+            return
+        }
+        // Go through AUAudioUnit's full state rather than casting to SynthAudioUnit:
+        // the unit's class comes from the bundled extension, not from this app.
+        var state = au.fullState ?? [:]
+        state[synthTimbreStateKey] = timbre.map { Double($0) }
+        au.fullState = state
+        let source = Int(SYNTH_PARAM_SOURCE_MIX)
+        au.parameterTree?.parameter(withAddress: AUParameterAddress(source))?.value = 1
+        model.params[source] = 1
+        model.status = "TIMBRE · \(name)"
     }
 }
 
@@ -81,6 +134,9 @@ struct SynthHostApp: App {
         WindowGroup("SynthRL") {
             ContentView(model: host.model)
                 .task { await host.start() }
+                .toolbar {
+                    Button("Load Timbre…") { host.loadTimbre() }
+                }
         }
         // Open at the content's ideal size so everything fits without scrolling.
         .windowResizability(.contentMinSize)

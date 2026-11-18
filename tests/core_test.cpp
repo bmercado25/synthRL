@@ -107,7 +107,7 @@ static float cutoff_for_hz(double hz) {
 int main() {
     std::printf("Filter schema and cutoff mapping\n");
     {
-        CHECK(synth_param_count() == 23, "23 parameters: osc, filter, envelopes, LFO and effects");
+        CHECK(synth_param_count() == 24, "24 parameters: osc, filter, envelopes, LFO, effects and source mix");
         CHECK(std::strcmp(synth_param_info(SYNTH_PARAM_REVERB_MIX).id, "reverb_mix") == 0,
               "reverb mix id");
         CHECK(synth_param_info(SYNTH_PARAM_OSC_A_DETUNE).min == -100.0f, "detune range is +/-100 cents");
@@ -479,6 +479,93 @@ int main() {
             synth_destroy(s);
         }
         CHECK(a == b, "two renders are bit-identical");
+    }
+
+    std::printf("Neural source: timbre sets the harmonics\n");
+    {
+        CHECK(std::strcmp(synth_param_info(SYNTH_PARAM_SOURCE_MIX).id, "source_mix") == 0,
+              "source mix id");
+        CHECK(synth_param_info(SYNTH_PARAM_SOURCE_MIX).defaultValue == 0.0f,
+              "source mix defaults to oscillators only");
+
+        // A4 with mix 1 and only a sine fundamental: pitch is 440 Hz.
+        const float sine[1] = {1.0f};
+        SynthCore* s = synth_create(kSR);
+        synth_set_timbre(s, sine, 1);
+        synth_set_param(s, SYNTH_PARAM_SOURCE_MIX, 1.0f);
+        synth_note_on(s, 69, 127);
+        std::vector<float> out(kSecond);
+        synth_render(s, out.data(), kSecond);
+        synth_destroy(s);
+        const double hz = estimate_hz(out, kSR);
+        CHECK(std::fabs(hz - 440.0) < 4.4, "sine timbre plays A4 at 440 Hz (within 1%)");
+
+        // Only harmonic 2 present: the waveform crosses zero twice per cycle of
+        // the fundamental, so A4 should read as 880 Hz.
+        const float second[2] = {0.0f, 1.0f};
+        s = synth_create(kSR);
+        synth_set_timbre(s, second, 2);
+        synth_set_param(s, SYNTH_PARAM_SOURCE_MIX, 1.0f);
+        synth_note_on(s, 69, 127);
+        synth_render(s, out.data(), kSecond);
+        synth_destroy(s);
+        CHECK(std::fabs(estimate_hz(out, kSR) - 880.0) < 8.8,
+              "harmonic 2 alone plays one octave up (880 Hz)");
+    }
+
+    std::printf("Neural source: default mix leaves the sound unchanged\n");
+    {
+        const float sine[1] = {1.0f};
+        std::vector<float> plain(kSecond / 2), with(kSecond / 2);
+        for (auto* buf : {&plain, &with}) {
+            SynthCore* s = synth_create(kSR);
+            if (buf == &with) synth_set_timbre(s, sine, 1);  // loaded, but mix stays 0
+            synth_note_on(s, 69, 100);
+            synth_render(s, buf->data(), kSecond / 2);
+            synth_destroy(s);
+        }
+        CHECK(plain == with, "timbre loaded at mix 0 changes nothing");
+    }
+
+    std::printf("Neural source: stays on pitch across the keyboard\n");
+    {
+        const float sine[1] = {1.0f};
+        for (int note : {21, 108}) {  // lowest and highest piano keys
+            SynthCore* s = synth_create(kSR);
+            synth_set_timbre(s, sine, 1);
+            synth_set_param(s, SYNTH_PARAM_SOURCE_MIX, 1.0f);
+            synth_note_on(s, note, 127);
+            // Eight seconds: a one-second window cannot resolve 27.5 Hz to within 1%.
+            std::vector<float> out(8 * kSecond);
+            synth_render(s, out.data(), 8 * kSecond);
+            synth_destroy(s);
+            const double want = 440.0 * std::pow(2.0, (note - 69) / 12.0);
+            const double got = estimate_hz(out, kSR);
+            const bool ok = std::fabs(got - want) < want * 0.01;
+            std::printf("  %s MIDI %d: want %.1f Hz, got %.1f Hz\n", ok ? "ok  " : "FAIL",
+                        note, want, got);
+            if (!ok) ++failures;
+        }
+    }
+
+    std::printf("Neural source: clearing and sample-rate change\n");
+    {
+        const float sine[1] = {1.0f};
+        SynthCore* s = synth_create(kSR);
+        synth_set_timbre(s, sine, 1);
+        synth_set_param(s, SYNTH_PARAM_SOURCE_MIX, 1.0f);
+        synth_set_timbre(s, nullptr, 0);  // clear
+        synth_note_on(s, 69, 127);
+        std::vector<float> cleared(kSecond / 4);
+        synth_render(s, cleared.data(), kSecond / 4);
+        CHECK(peak(cleared) < 1e-6, "cleared timbre with mix 1 is silent");
+
+        synth_set_timbre(s, sine, 1);
+        synth_set_sample_rate(s, 44100.0);  // rebuilds the loaded timbre
+        std::vector<float> after(kSecond / 4);
+        synth_render(s, after.data(), kSecond / 4);
+        CHECK(peak(after) > 0.05, "timbre still sounds after a sample-rate change");
+        synth_destroy(s);
     }
 
     std::printf("\n%s (%d failure%s)\n", failures ? "FAILED" : "PASSED",
