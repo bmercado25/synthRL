@@ -27,3 +27,6 @@ __pycache__/
 # Model checkpoints (large, local only)
 *.pt
 *.pth
+
+# Local planning notes (design notes not committed to the repo)
+/plans/
