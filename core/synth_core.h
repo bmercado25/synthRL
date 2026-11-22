@@ -41,6 +41,9 @@ enum {
     SYNTH_PARAM_REVERB_SIZE,       // 0-1: room size (decay time)
     SYNTH_PARAM_SOURCE_MIX,        // 0-1: 0 = oscillators, 1 = neural source (timbre from synth_set_timbre)
     SYNTH_PARAM_MOVEMENT,          // 0-1: 0 = static neural source, 1 = the source's measured movement
+    SYNTH_PARAM_FILTER_MODE,       // 0-1: 0 = low-pass, 1/3 = band-pass, 2/3 = high-pass, 1 = notch (blends between neighbours)
+    SYNTH_PARAM_SPECTRAL_AMOUNT,   // 0-1: how much of the attack spectrum a note starts with (0 = none, the sustain spectrum only)
+    SYNTH_PARAM_SPECTRAL_TIME,     // 0-1: how fast the attack spectrum fades to the sustain spectrum, 10 ms - 2 s
     SYNTH_PARAM_COUNT
 };
 
@@ -154,6 +157,15 @@ typedef struct {
 // Off the audio thread, like synth_set_timbre_shaped.
 void synth_set_timbre_moving(SynthCore* core, const float* harmonics, int count,
                              const SynthMovement* movement);
+
+// Sets the timbre with an optional attack spectrum (step 2d) and everything
+// else. `attack` may be null, in which case there is no attack spectrum. Its
+// amplitudes use the same scale as `harmonics`, so the two spectra keep their
+// level relationship. Off the audio thread, like synth_set_timbre_shaped.
+void synth_set_timbre_full(SynthCore* core, const float* harmonics, int count,
+                           const float* attack, int attackCount,
+                           const float* envelope, int envCount,
+                           const SynthMovement* movement);
 
 #ifdef __cplusplus
 }

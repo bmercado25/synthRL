@@ -27,10 +27,13 @@ enum SourceMode: String, CaseIterable, Identifiable {
 final class AudioHost: ObservableObject {
     let model = SynthModel()
     @Published var sourceMode: SourceMode = .analysis
+    /// Fit the synth controls to the imported sample (about 30 s), then A/B against the source controls.
+    @Published var fitOnImport = true
     @Published private(set) var isImporting = false
     private let engine = AVAudioEngine()
     private var unit: AVAudioUnit?
-    private var pendingTimbre: (name: String, values: [Float], envelope: [Float], movement: TimbreMovement?)?
+    private var pendingTimbre: (name: String, values: [Float], attack: [Float], envelope: [Float],
+                                movement: TimbreMovement?, patch: [(Int, Float)]?)?
 
     private static let projectRootKey = "projectRoot"
     private static let checkpointKey = "checkpointPath"
@@ -82,8 +85,8 @@ final class AudioHost: ObservableObject {
             NSLog("SynthRL audio running at %f Hz", rate)
             if let pending = pendingTimbre {
                 pendingTimbre = nil
-                apply(timbre: pending.values, envelope: pending.envelope,
-                      movement: pending.movement, name: pending.name)
+                apply(timbre: pending.values, attack: pending.attack, envelope: pending.envelope,
+                      movement: pending.movement, patch: pending.patch, name: pending.name)
             }
         } catch {
             let e = error as NSError
@@ -116,7 +119,7 @@ final class AudioHost: ObservableObject {
         }
 
         isImporting = true
-        model.status = "ANALYSING · \(picked.lastPathComponent)"
+        model.status = (fitOnImport ? "ANALYSING + FITTING · " : "ANALYSING · ") + picked.lastPathComponent
         Task {
             // Temporary files this import creates; removed when it finishes.
             var temporary: [URL] = []
@@ -134,6 +137,9 @@ final class AudioHost: ObservableObject {
                 var args = [wav.path, out.path]
                 if let checkpoint {
                     args += ["--checkpoint", checkpoint.path]
+                }
+                if fitOnImport {
+                    args += ["--fit", "--fit-seconds", "30"]
                 }
                 let summary = try await runProcess(
                     root.appendingPathComponent(".venv/bin/python"),
@@ -193,15 +199,19 @@ final class AudioHost: ObservableObject {
             // Version 3 files may carry the source's movement instead (it replaces the envelope).
             let envelope = (doc["envelope"] as? [Double] ?? []).map { Float($0) }
             let movement = Self.parseMovement(doc)
+            let patch = Self.parsePatch(doc)
+            // Version 5 files may carry the attack spectrum (the first 100 ms).
+            let attack = (doc["harmonics_attack"] as? [Double] ?? []).map { Float($0) }
             let harmonics = values.map { Float($0) }
             // Audio may still be starting (the unit is created asynchronously).
             // Keep the timbre and apply it as soon as audio is running.
             guard unit != nil else {
-                pendingTimbre = (name, harmonics, envelope, movement)
+                pendingTimbre = (name, harmonics, attack, envelope, movement, patch)
                 model.status = "TIMBRE · waiting for audio: \(name)"
                 return
             }
-            apply(timbre: harmonics, envelope: envelope, movement: movement, name: name)
+            apply(timbre: harmonics, attack: attack, envelope: envelope, movement: movement,
+                  patch: patch, name: name)
         } catch {
             model.status = "TIMBRE ERROR · \(error.localizedDescription)"
         }
@@ -297,12 +307,27 @@ final class AudioHost: ObservableObject {
                               brightnessOct: bright.map { Float($0) })
     }
 
+    /// The patch block of a version 4 timbre file (step 2d): (AU address, value) pairs.
+    private static func parsePatch(_ doc: [String: Any]) -> [(Int, Float)]? {
+        guard let block = doc["patch"] as? [String: [String: Any]] else { return nil }
+        var pairs: [(Int, Float)] = []
+        for (_, entry) in block {
+            guard let index = entry["index"] as? NSNumber,
+                  let value = entry["value"] as? NSNumber else { continue }
+            pairs.append((index.intValue, value.floatValue))
+        }
+        return pairs
+    }
+
     /// Pushes a timbre into the running unit and makes it audible.
-    private func apply(timbre: [Float], envelope: [Float], movement: TimbreMovement?, name: String) {
+    private func apply(timbre: [Float], attack: [Float], envelope: [Float], movement: TimbreMovement?,
+                       patch: [(Int, Float)]?, name: String) {
         guard let au = unit?.auAudioUnit else {
             model.status = "TIMBRE ERROR · audio is not running"
             return
         }
+        // The controls as they were before this timbre, for A/B against the patch.
+        let before = model.params
         // Go through AUAudioUnit's full state rather than casting to SynthAudioUnit:
         // the unit's class comes from the bundled extension, not from this app.
         // An envelope or movement key left over from an earlier timbre must not
@@ -319,11 +344,33 @@ final class AudioHost: ObservableObject {
         } else {
             state.removeValue(forKey: synthTimbreMovementStateKey)
         }
+        if attack.isEmpty {
+            state.removeValue(forKey: synthTimbreAttackStateKey)
+        } else {
+            state[synthTimbreAttackStateKey] = attack.map { Double($0) }
+        }
         au.fullState = state
         let source = Int(SYNTH_PARAM_SOURCE_MIX)
         au.parameterTree?.parameter(withAddress: AUParameterAddress(source))?.value = 1
         model.params[source] = 1
-        model.status = "TIMBRE · \(name)"
+        model.fitSource = nil
+        model.fitPatch = nil
+        model.fitAB = false
+        // A fitted patch sets controls through the parameter tree, so the UI and
+        // the unit stay in step. Source (A) keeps the controls as they were.
+        if let patch, !patch.isEmpty {
+            var sourceControls = before
+            sourceControls[source] = 1
+            for (index, value) in patch where index < model.params.count {
+                model.setParam(index, value)
+            }
+            model.fitSource = sourceControls
+            model.fitPatch = model.params
+            model.fitAB = true
+            model.status = "TIMBRE · \(name) · FIT"
+        } else {
+            model.status = "TIMBRE · \(name)"
+        }
     }
 }
 
@@ -341,6 +388,9 @@ struct SynthHostApp: App {
                     }
                     .pickerStyle(.segmented)
                     .disabled(host.isImporting)
+                    Toggle("Fit", isOn: $host.fitOnImport)
+                        .toggleStyle(.button)
+                        .disabled(host.isImporting)
                     Button("Import Sample…") { host.importSample() }
                         .disabled(host.isImporting)
                     Button("Checkpoint…") { host.chooseCheckpoint() }

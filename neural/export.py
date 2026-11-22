@@ -31,12 +31,18 @@ def main(argv=None):
                         help="use a trained step 2b model instead of the step 2a analysis")
     parser.add_argument("--no-movement", action="store_true",
                         help="leave out the loudness, pitch and brightness movement (step 2c)")
+    parser.add_argument("--fit", action="store_true",
+                        help="also fit the synth controls to the note (step 2d); "
+                             "needs build/libsynthcore.dylib")
+    parser.add_argument("--fit-seconds", type=float, default=30.0,
+                        help="time cap for the fit (default 30)")
     args = parser.parse_args(argv)
 
     from .model import SR
     try:
         wave, _ = librosa.load(args.wav, sr=SR, mono=True)
         movement = None
+        attack = None  # only the analysis path measures an attack spectrum
         if args.checkpoint:
             from .evaluate import load_model
             from .model import export_from_model, fit_to_note
@@ -49,6 +55,7 @@ def main(argv=None):
         else:
             result = analyze_file(args.wav)
             harmonics, f0 = result.harmonics, result.f0_hz
+            attack = result.attack_harmonics
             envelope = None
             method = "analysis"
         if not args.no_movement:
@@ -59,8 +66,24 @@ def main(argv=None):
         print(f"error: {err}", file=sys.stderr)
         return 1
 
+    patch = None
+    if args.fit:
+        from .fit import fit_patch
+        import numpy as np
+        midi = 60 if f0 is None else int(round(69 + 12 * np.log2(f0 / 440.0)))
+        try:
+            result = fit_patch(wave, harmonics, movement, midi=midi,
+                               seconds=args.fit_seconds)
+        except (OSError, ValueError) as err:
+            print(f"error: fit failed: {err}", file=sys.stderr)
+            return 1
+        patch = result.patch
+        print(f"fit at MIDI {midi}: loss {result.neutral_loss:.3f} -> "
+              f"{result.fitted_loss:.3f} in {result.seconds:.1f} s, {result.evals} evaluations")
+
     write_timbre(args.out, harmonics, f0_hz=f0, source_name=Path(args.wav).name,
-                 envelope=envelope, movement=movement)
+                 envelope=envelope, movement=movement, patch=patch,
+                 attack_harmonics=attack)
     audible = int((harmonics > 0.01).sum())
     if movement is not None:
         shape = (f"movement {len(movement) / movement.rate_hz:.2f} s, "

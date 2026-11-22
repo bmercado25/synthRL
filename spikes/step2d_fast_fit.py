@@ -15,7 +15,6 @@ Run:  .venv/bin/python spikes/step2d_fast_fit.py [--clips 8] [--seconds 30]
 """
 
 import argparse
-import json
 import multiprocessing as mp
 import sys
 import time
@@ -27,27 +26,11 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-FREE = ["env_attack", "env_decay", "env_sustain", "env_release",
-        "filter_cutoff", "filter_resonance", "drive",
-        "filter_env_amount", "lfo_pitch_depth", "lfo_rate"]
-
-# Staged CMA-ES, as in the Phase 0b diagnostics: groups first, then everything.
-STAGES = [
-    (["env_attack", "env_decay", "env_sustain", "env_release", "filter_cutoff"], 0.4),
-    (["filter_env_amount", "lfo_pitch_depth", "lfo_rate"], 0.4),
-    (["filter_resonance", "drive"], 0.3),
-    (FREE, 0.2),
-]
-
-SCHEMA = {p["id"]: p for p in json.loads((ROOT / "schema" / "synth_params.json").read_text())["parameters"]}
-HOLD_S = 3.0  # NSynth notes are 3 s held, then a release tail to 4 s
-
-
-def select_notes(count):
+def select_notes(count, split="valid"):
     """Pitch-60 notes, one per instrument, round-robin across instrument families."""
     from neural.data import load_split, read_wave
     by_family = {}
-    for note in sorted(load_split("valid"), key=lambda n: (n.instrument, -n.velocity)):
+    for note in sorted(load_split(split), key=lambda n: (n.instrument, -n.velocity)):
         if note.pitch != 60:
             continue
         family = note.instrument.split("_")[0]
@@ -56,35 +39,16 @@ def select_notes(count):
             group.append(note)
     queues = [list(v) for _, v in sorted(by_family.items())]
     chosen = []
-    while queues and len(chosen) < count:
+    while len(chosen) < count:
+        added = False
         for queue in queues:
             if queue and len(chosen) < count:
                 note = queue.pop(0)
                 chosen.append((note.path, note.pitch, note.velocity, read_wave(note)))
+                added = True
+        if not added:  # every family is exhausted: fewer notes than requested
+            break
     return chosen
-
-
-def prepare(wave):
-    """Analysis and movement for one note, at its own pitch."""
-    from neural.analyze import analyze
-    from neural.model import SR
-    from neural.movement import measure_movement
-    analysis = analyze(wave, SR)
-    midi = int(round(69 + 12 * np.log2(analysis.f0_hz / 440.0)))
-    return analysis.harmonics, measure_movement(wave), midi
-
-
-def unit_to_values(unit):
-    out = {}
-    for name, u in zip(FREE, unit):
-        p = SCHEMA[name]
-        out[name] = p["min"] + float(np.clip(u, 0.0, 1.0)) * (p["max"] - p["min"])
-    return out
-
-
-def default_unit():
-    return np.array([(SCHEMA[n]["default"] - SCHEMA[n]["min"]) /
-                     (SCHEMA[n]["max"] - SCHEMA[n]["min"]) for n in FREE])
 
 
 def held_out_distance(render, target):
@@ -100,77 +64,40 @@ def held_out_distance(render, target):
 
 
 def fit_note(args):
-    """Worker: baseline, time-capped staged CMA-ES, held-out check for one note."""
-    import cma
+    """Worker: one note, fitted with the shared fit and checked on a held-out measure."""
     from neural.coreplay import Core, render_patch
+    from neural.fit import fit_patch, default_unit, unit_to_values
+    from neural.analyze import analyze
     from neural.model import SR
-    import step2d_match_spike as spike
+    from neural.movement import measure_movement
 
     index, path, pitch, velocity, wave, seconds = args
     try:
-        harmonics, movement, midi = prepare(wave)
+        analysis = analyze(wave, SR)
     except ValueError as exc:  # no clear pitch: the plugin would fall back to note 60
         return {"index": index, "path": Path(path).name, "skipped": str(exc)}
-    target = wave
-    tail_s = len(target) / SR - HOLD_S
+    harmonics = analysis.harmonics
+    movement = measure_movement(wave)
+    # The NSynth label is ground truth here, so an octave error in pYIN cannot
+    # move the fit to the wrong pitch. Its analysed pitch is reported as a check.
+    analysed_midi = int(round(69 + 12 * np.log2(analysis.f0_hz / 440.0)))
 
+    result = fit_patch(wave, harmonics, movement, midi=pitch, velocity=velocity,
+                       seconds=seconds)
+    hold_s = max(len(wave) / SR - 1.0, 0.5 * len(wave) / SR)
     core = Core(SR)
     core.set_timbre_moving(harmonics, movement)
     core.set_param("source_mix", 1.0)
-
-    def render(unit):
-        return render_patch(core, unit_to_values(unit), midi=midi, velocity=velocity,
-                            hold_s=HOLD_S, tail_s=tail_s)
-
-    base = default_unit()
-    baseline_render = render(base)
-    baseline_fit = spike.loss(baseline_render, target)
-    baseline_held = held_out_distance(baseline_render, target)
-
-    best = {"x": base.copy(), "f": baseline_fit, "evals": 0}
-    deadline = time.perf_counter() + seconds
-    t0 = time.perf_counter()
-
-    def objective(unit):
-        unit = np.clip(unit, 0.0, 1.0)
-        if time.perf_counter() > deadline:
-            raise TimeoutError
-        best["evals"] += 1
-        value = spike.loss(render(unit), target)
-        if value < best["f"]:
-            best["f"], best["x"] = value, unit.copy()
-        return value
-
-    x = base.copy()
-    try:
-        for stage, (names, sigma) in enumerate(STAGES):
-            idx = [FREE.index(n) for n in names]
-
-            def sub(z, idx=idx):
-                y = best["x"].copy()
-                y[idx] = np.clip(z, 0.0, 1.0)
-                return objective(y)
-
-            es = cma.CMAEvolutionStrategy(best["x"][idx], sigma,
-                                          {"bounds": [0.0, 1.0], "verbose": -9,
-                                           "seed": index * 10 + stage, "maxfevals": 10 ** 6,
-                                           "tolfun": 1e-12, "tolx": 1e-7})
-            while not es.stop():
-                cands = es.ask()
-                es.tell(cands, [sub(z) for z in cands])
-    except TimeoutError:
-        pass
-    elapsed = time.perf_counter() - t0
-
-    fitted_render = render(best["x"])
-    fitted_held = held_out_distance(fitted_render, target)
-    moved = {n: round(float(best["x"][i]), 3) for i, n in enumerate(FREE)
-             if abs(best["x"][i] - base[i]) > 0.05}
-    return {"index": index, "path": Path(path).name, "pitch": pitch, "midi": midi,
-            "baseline_fit": baseline_fit, "fitted_fit": best["f"],
-            "baseline_held": baseline_held, "fitted_held": fitted_held,
-            "evals": best["evals"], "seconds": elapsed, "moved": moved,
-            "patch": {n: round(unit_to_values(best["x"])[n], 4) for n in FREE}}
+    baseline = render_patch(core, unit_to_values(default_unit()), midi=pitch,
+                            velocity=velocity, hold_s=hold_s, tail_s=len(wave) / SR - hold_s)
+    fitted = render_patch(core, result.patch, midi=pitch, velocity=velocity,
+                          hold_s=hold_s, tail_s=len(wave) / SR - hold_s)
+    return {"index": index, "path": Path(path).name, "pitch": pitch, "midi": analysed_midi,
+            "baseline_fit": result.neutral_loss, "fitted_fit": result.fitted_loss,
+            "baseline_held": held_out_distance(baseline, wave),
+            "fitted_held": held_out_distance(fitted, wave),
+            "evals": result.evals, "seconds": result.seconds,
+            "moved": {n: result.patch[n] for n in result.moved}, "patch": result.patch}
 
 
 def main(argv=None):
@@ -191,12 +118,12 @@ def main(argv=None):
         print(f"skipped {r['path']}: {r['skipped']}")
     results = sorted((r for r in outcomes if "skipped" not in r), key=lambda r: r["index"])[:args.clips]
     print(f"{len(results)} fitted, {len(skipped)} skipped (no clear pitch)")
-    print(f"\n{'note':<34} {'midi':>4} {'fit base':>8} {'fit':>7} {'down%':>6} "
+    print(f"\n{'note':<34} {'label':>5} {'pyin':>4} {'fit base':>8} {'fit':>7} {'down%':>6} "
           f"{'held base':>9} {'held':>6} {'down%':>6} {'evals':>6}")
     for r in results:
         fit_down = 100 * (1 - r["fitted_fit"] / r["baseline_fit"])
         held_down = 100 * (1 - r["fitted_held"] / r["baseline_held"])
-        print(f"{r['path']:<34} {r['midi']:>4} {r['baseline_fit']:8.3f} {r['fitted_fit']:7.3f} "
+        print(f"{r['path']:<34} {r['pitch']:>5} {r['midi']:>4} {r['baseline_fit']:8.3f} {r['fitted_fit']:7.3f} "
               f"{fit_down:6.1f} {r['baseline_held']:9.2f} {r['fitted_held']:6.2f} "
               f"{held_down:6.1f} {r['evals']:6d}")
     fit_medians = [100 * (1 - r["fitted_fit"] / r["baseline_fit"]) for r in results]
@@ -209,7 +136,7 @@ def main(argv=None):
         print(f"  {r['path']}: moved {r['moved']}")
     print("\nFitted patch, to set by hand in the app (schema values):")
     for r in results:
-        print(f"  {r['path']} (MIDI {r['midi']}):")
+        print(f"  {r['path']} (MIDI {r['pitch']}):")
         for name, value in r["patch"].items():
             print(f"    {name} = {value}")
     return 0

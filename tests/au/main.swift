@@ -184,6 +184,7 @@ do {
         (17, "lfo_rate"), (18, "lfo_pitch_depth"), (19, "lfo_filter_depth"),
         (20, "drive"), (21, "reverb_mix"), (22, "reverb_size"),
         (23, "source_mix"), (24, "movement"),
+        (25, "filter_mode"), (26, "spectral_amount"), (27, "spectral_time"),
     ]
     for (address, identifier) in expected {
         check(tree.parameter(withAddress: address)?.identifier == identifier,

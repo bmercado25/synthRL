@@ -45,6 +45,9 @@ const SynthParamInfo kParams[SYNTH_PARAM_COUNT] = {
     {"source_mix",   "Source Mix",   SYNTH_PARAM_CONTINUOUS, 0.0f, 1.0f, 0.0f},
     // Movement of the neural source. Defaults to full, so a timbre with movement plays it.
     {"movement",     "Movement",     SYNTH_PARAM_CONTINUOUS, 0.0f, 1.0f, 1.0f},
+    {"filter_mode",  "Filter Mode",  SYNTH_PARAM_CONTINUOUS, 0.0f, 1.0f, 0.0f},
+    {"spectral_amount", "Spectral Amount", SYNTH_PARAM_CONTINUOUS, 0.0f, 1.0f, 0.0f},
+    {"spectral_time",   "Spectral Time",   SYNTH_PARAM_CONTINUOUS, 0.0f, 1.0f, 0.5f},
 };
 
 const double kMinCutoffHz = 20.0;
@@ -183,12 +186,20 @@ struct Envelope {
 
 // Topology-preserving state-variable filter (Zavalishin's TPT form). Stable at
 // any cutoff below Nyquist. Only the low-pass output is used.
+// The four outputs of one filter step: low-pass, band-pass, high-pass and notch.
+struct SvfOutputs {
+    double lp;
+    double bp;
+    double hp;
+    double notch;
+};
+
 struct SvfLowpass {
     double ic1 = 0.0;  // integrator 1 state
     double ic2 = 0.0;  // integrator 2 state
 
-    // g: pre-warped cutoff, k: damping (1/Q)
-    double process(double x, double g, double k) {
+    // g: pre-warped cutoff, k: damping (1/Q). Returns all modes of one step.
+    SvfOutputs process(double x, double g, double k) {
         const double a1 = 1.0 / (1.0 + g * (g + k));
         const double a2 = g * a1;
         const double a3 = g * a2;
@@ -197,9 +208,19 @@ struct SvfLowpass {
         const double v2 = ic2 + a2 * ic1 + a3 * v3;
         ic1 = 2.0 * v1 - ic1;
         ic2 = 2.0 * v2 - ic2;
-        return v2;
+        const double hp = x - k * v1 - v2;
+        return {v2, v1, hp, v2 + hp};
     }
 };
+
+// Blends the four modes by position 0-1: LP, BP, HP, notch, equal steps.
+double filter_mode_blend(const SvfOutputs& o, double mode) {
+    const double s = std::fmin(std::fmax(mode, 0.0), 1.0) * 3.0;
+    const int i = std::min(static_cast<int>(s), 2);
+    const double f = s - i;
+    const double corner[4] = {o.lp, o.bp, o.hp, o.notch};
+    return (1.0 - f) * corner[i] + f * corner[i + 1];
+}
 
 struct CombFilter {
     std::vector<double> buf;
@@ -296,6 +317,10 @@ struct TimbreSet {
     float harmonics[SYNTH_TIMBRE_MAX_HARMONICS] = {};
     // One extra sample per table so linear interpolation can wrap without a branch.
     float tables[kWaveBands][kWaveTableSize + 1] = {};
+    // Attack spectrum (step 2d). Same scale as `tables`. Used only when hasAttack.
+    float attackHarmonics[SYNTH_TIMBRE_MAX_HARMONICS] = {};
+    float attackTables[kWaveBands][kWaveTableSize + 1] = {};
+    bool hasAttack = false;
     // Loudness over the note (see synth_set_timbre_shaped). envCount 0 = no envelope.
     float envelope[SYNTH_TIMBRE_MAX_ENV_POINTS] = {};
     int envCount = 0;
@@ -397,7 +422,26 @@ double envelope_at(const TimbreSet& set, double t) {
 
 // Builds all bands from `harmonics` into `set`, at sample rate `sr`.
 // Allocates nothing: the storage lives inside TimbreSet.
-void build_timbre(TimbreSet& set, const float* harmonics, int count, double sr) {
+// Fills one wavetable per band from a harmonic set, scaled by `scale`.
+void build_tables(float tables[kWaveBands][kWaveTableSize + 1], const float* harmonics,
+                  double scale, double sr) {
+    for (int b = 0; b < kWaveBands; ++b) {
+        const double topHz = kBandBaseHz * std::pow(2.0, b);
+        int kmax = static_cast<int>(std::floor(kTimbreNyquistLimit * sr / topHz));
+        if (kmax > SYNTH_TIMBRE_MAX_HARMONICS) kmax = SYNTH_TIMBRE_MAX_HARMONICS;
+        for (int n = 0; n < kWaveTableSize; ++n) {
+            double s = 0.0;
+            for (int k = 1; k <= kmax; ++k) {
+                s += harmonics[k - 1] * std::sin(kTwoPi * k * n / kWaveTableSize);
+            }
+            tables[b][n] = static_cast<float>(s * scale);
+        }
+        tables[b][kWaveTableSize] = tables[b][0];
+    }
+}
+
+// Builds the sustain timbre. Returns the scale used, so an attack spectrum can share it.
+double build_timbre(TimbreSet& set, const float* harmonics, int count, double sr) {
     for (int k = 0; k < SYNTH_TIMBRE_MAX_HARMONICS; ++k) {
         set.harmonics[k] = (k < count) ? harmonics[k] : 0.0f;
     }
@@ -413,20 +457,21 @@ void build_timbre(TimbreSet& set, const float* harmonics, int count, double sr) 
         fullPeak = std::fmax(fullPeak, std::fabs(s));
     }
     const double scale = fullPeak > 0.0 ? 1.0 / fullPeak : 0.0;
+    build_tables(set.tables, set.harmonics, scale, sr);
+    return scale;
+}
 
-    for (int b = 0; b < kWaveBands; ++b) {
-        const double topHz = kBandBaseHz * std::pow(2.0, b);
-        int kmax = static_cast<int>(std::floor(kTimbreNyquistLimit * sr / topHz));
-        if (kmax > SYNTH_TIMBRE_MAX_HARMONICS) kmax = SYNTH_TIMBRE_MAX_HARMONICS;
-        for (int n = 0; n < kWaveTableSize; ++n) {
-            double s = 0.0;
-            for (int k = 1; k <= kmax; ++k) {
-                s += set.harmonics[k - 1] * std::sin(kTwoPi * k * n / kWaveTableSize);
-            }
-            set.tables[b][n] = static_cast<float>(s * scale);
-        }
-        set.tables[b][kWaveTableSize] = set.tables[b][0];
+// Stores an attack spectrum, built with the sustain's scale. Null or zero count clears it.
+void set_attack(TimbreSet& set, const float* attack, int count, double scale, double sr) {
+    if (!attack || count <= 0) {
+        set.hasAttack = false;
+        return;
     }
+    for (int k = 0; k < SYNTH_TIMBRE_MAX_HARMONICS; ++k) {
+        set.attackHarmonics[k] = (k < count) ? attack[k] : 0.0f;
+    }
+    build_tables(set.attackTables, set.attackHarmonics, scale, sr);
+    set.hasAttack = true;
 }
 
 // Band whose table is alias-free for a note at `hz`.
@@ -448,6 +493,24 @@ double read_timbre(const TimbreSet& set, double hz, double cps, double& phase) {
     phase += cps;
     if (phase >= 1.0) phase -= 1.0;
     return out;
+}
+
+// Reads the sustain table, blended toward the attack table by `attackWeight` (0-1).
+// With weight 0 (or no attack spectrum) this is exactly read_timbre.
+double read_timbre_morph(const TimbreSet& set, double hz, double cps, double& phase,
+                         double attackWeight) {
+    if (attackWeight <= 0.0 || !set.hasAttack) return read_timbre(set, hz, cps, phase);
+    const int band = band_for_hz(hz);
+    const double pos = phase * kWaveTableSize;
+    int i = static_cast<int>(pos);
+    const double frac = pos - i;
+    const float* t = set.tables[band];
+    const float* a = set.attackTables[band];
+    const double sustain = t[i] + frac * (t[i + 1] - t[i]);
+    const double attack = a[i] + frac * (a[i + 1] - a[i]);
+    phase += cps;
+    if (phase >= 1.0) phase -= 1.0;
+    return (1.0 - attackWeight) * sustain + attackWeight * attack;
 }
 
 // One sounding note: its own oscillators, filter and envelopes. Voices are
@@ -475,6 +538,13 @@ float synth_cutoff_hz(float normalized) {
     if (normalized < 0.0f) normalized = 0.0f;
     if (normalized > 1.0f) normalized = 1.0f;
     return static_cast<float>(kMinCutoffHz * std::pow(kMaxCutoffHz / kMinCutoffHz, normalized));
+}
+
+// Time constant for the attack spectrum to fade to the sustain spectrum: 10 ms to 2 s.
+float synth_spectral_seconds(float normalized) {
+    if (normalized < 0.0f) normalized = 0.0f;
+    if (normalized > 1.0f) normalized = 1.0f;
+    return static_cast<float>(0.01 * std::pow(200.0, normalized));
 }
 
 float synth_envelope_seconds(float normalized) {
@@ -583,7 +653,10 @@ void synth_set_sample_rate(SynthCore* core, double sample_rate) {
     if (front >= 0) {
         const int back = 1 - front;
         const TimbreSet& old = core->timbreSets[front];
-        build_timbre(core->timbreSets[back], old.harmonics, SYNTH_TIMBRE_MAX_HARMONICS, sample_rate);
+        const double scale = build_timbre(core->timbreSets[back], old.harmonics,
+                                          SYNTH_TIMBRE_MAX_HARMONICS, sample_rate);
+        set_attack(core->timbreSets[back], old.hasAttack ? old.attackHarmonics : nullptr,
+                   SYNTH_TIMBRE_MAX_HARMONICS, scale, sample_rate);
         set_envelope(core->timbreSets[back], old.envelope, old.envCount);
         copy_movement(core->timbreSets[back], old);
         core->timbreFront.store(back, std::memory_order_release);
@@ -592,6 +665,7 @@ void synth_set_sample_rate(SynthCore* core, double sample_rate) {
 
 // Builds a timbre into the back set and publishes it. Shared by the setters below.
 void publish_timbre(SynthCore* core, const float* harmonics, int count,
+                    const float* attack, int attackCount,
                     const float* envelope, int envCount, const SynthMovement* movement) {
     if (count <= 0 || !harmonics) {
         core->timbreFront.store(-1, std::memory_order_release);
@@ -600,7 +674,8 @@ void publish_timbre(SynthCore* core, const float* harmonics, int count,
     if (count > SYNTH_TIMBRE_MAX_HARMONICS) count = SYNTH_TIMBRE_MAX_HARMONICS;
     const int front = core->timbreFront.load(std::memory_order_acquire);
     const int back = front == 0 ? 1 : 0;
-    build_timbre(core->timbreSets[back], harmonics, count, core->sampleRate);
+    const double scale = build_timbre(core->timbreSets[back], harmonics, count, core->sampleRate);
+    set_attack(core->timbreSets[back], attack, attackCount, scale, core->sampleRate);
     set_envelope(core->timbreSets[back], envelope, envCount);
     set_movement(core->timbreSets[back], movement);
     core->timbreFront.store(back, std::memory_order_release);
@@ -609,13 +684,21 @@ void publish_timbre(SynthCore* core, const float* harmonics, int count,
 void synth_set_timbre_shaped(SynthCore* core, const float* harmonics, int count,
                              const float* envelope, int envCount) {
     if (!core) return;
-    publish_timbre(core, harmonics, count, envelope, envCount, nullptr);
+    publish_timbre(core, harmonics, count, nullptr, 0, envelope, envCount, nullptr);
 }
 
 void synth_set_timbre_moving(SynthCore* core, const float* harmonics, int count,
                              const SynthMovement* movement) {
     if (!core) return;
-    publish_timbre(core, harmonics, count, nullptr, 0, movement);
+    publish_timbre(core, harmonics, count, nullptr, 0, nullptr, 0, movement);
+}
+
+void synth_set_timbre_full(SynthCore* core, const float* harmonics, int count,
+                           const float* attack, int attackCount,
+                           const float* envelope, int envCount,
+                           const SynthMovement* movement) {
+    if (!core) return;
+    publish_timbre(core, harmonics, count, attack, attackCount, envelope, envCount, movement);
 }
 
 void synth_set_timbre(SynthCore* core, const float* harmonics, int count) {
@@ -688,6 +771,8 @@ void synth_render(SynthCore* core, float* out, int frames) {
 
     const double baseCutoffHz = synth_cutoff_hz(static_cast<float>(load(SYNTH_PARAM_FILTER_CUTOFF)));
     const double resonance = load(SYNTH_PARAM_FILTER_RESONANCE);
+    const double filterMode = load(SYNTH_PARAM_FILTER_MODE);
+    const double spectralAmount = std::fmin(std::fmax(load(SYNTH_PARAM_SPECTRAL_AMOUNT), 0.0), 1.0);
     const double k = kFlatDamping + (kMinDamping - kFlatDamping) * resonance;
     const double filterEnvOctaves = load(SYNTH_PARAM_FILTER_ENV_AMOUNT) * kFilterEnvOctaves;
 
@@ -707,6 +792,8 @@ void synth_render(SynthCore* core, float* out, int frames) {
     const int timbreIndex = core->timbreFront.load(std::memory_order_acquire);
     const TimbreSet* timbre = timbreIndex >= 0 ? &core->timbreSets[timbreIndex] : nullptr;
     const double movement = std::fmin(std::fmax(load(SYNTH_PARAM_MOVEMENT), 0.0), 1.0);
+    const double spectralTauSamples =
+        synth_spectral_seconds(static_cast<float>(load(SYNTH_PARAM_SPECTRAL_TIME))) * sr;
 
     // Envelope steps, once per block.
     const double ampAttack = env_step(static_cast<float>(load(SYNTH_PARAM_ENV_ATTACK)), sr);
@@ -754,7 +841,11 @@ void synth_render(SynthCore* core, float* out, int frames) {
                     gain = envelope_at(*timbre, v.envSamples / (SYNTH_TIMBRE_ENV_SECONDS * sr));
                 }
                 const double cpsN = cpsA * std::exp2(pitchCents / 1200.0);
-                raw += sourceMix * gain * read_timbre(*timbre, cpsN * sr, cpsN, v.tablePhase);
+                // The attack spectrum fades out after note-on, so it only matters early in the note.
+                const double attackWeight = spectralAmount > 0.0
+                    ? spectralAmount * std::exp(-v.envSamples / spectralTauSamples) : 0.0;
+                raw += sourceMix * gain *
+                       read_timbre_morph(*timbre, cpsN * sr, cpsN, v.tablePhase, attackWeight);
             }
             v.envSamples += 1.0;
 
@@ -764,7 +855,7 @@ void synth_render(SynthCore* core, float* out, int frames) {
                             std::exp2(filterEnvOctaves * v.filterEnv.level + lfoFilterOctaves * lfo + brightOct);
             cutoff = std::fmin(std::fmax(cutoff, kMinCutoffHz), 0.45 * sr);
             const double g = std::tan(kPi * cutoff / sr);
-            const double filtered = v.filter.process(raw, g, k);
+            const double filtered = filter_mode_blend(v.filter.process(raw, g, k), filterMode);
 
             mixed += v.velocityGain * v.ampEnv.level * filtered;
         }

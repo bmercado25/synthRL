@@ -12,6 +12,16 @@ Version 3 adds an optional "movement" block (step 2c): the source's loudness,
 pitch and brightness tracks on a 50 Hz grid, plus a loop region. When it is
 present the core plays it instead of the envelope, scaled by the Movement
 control. Versions 1 and 2 are still read.
+
+Version 4 adds an optional "patch" block (step 2d): synth control values from
+the fit in neural/fit.py. It is a map from schema id to {"index", "value"}.
+The index is the parameter's AU address, and the host applies each value
+through the parameter tree after loading the timbre. Each value is checked
+against the schema's range on write and on read.
+
+Version 5 adds an optional "harmonics_attack" list (step 2d): the spectrum of
+the first 100 ms, on the same scale as "harmonics". The synth blends toward it
+after note-on, controlled by the Spectral Amount and Spectral Time parameters.
 """
 
 import json
@@ -20,11 +30,12 @@ from pathlib import Path
 import numpy as np
 
 from .analyze import HARMONICS
+from .coreplay import param_info
 from .movement import MAX_FRAMES, Movement
 
 FORMAT = "synth-timbre"
-VERSION = 3
-READABLE_VERSIONS = (1, 2, 3)
+VERSION = 5
+READABLE_VERSIONS = (1, 2, 3, 4, 5)
 MAX_ENVELOPE = 64  # matches SYNTH_TIMBRE_MAX_ENV_POINTS in core/synth_core.h
 
 
@@ -41,7 +52,51 @@ def _movement_doc(movement):
     }
 
 
-def write_timbre(path, harmonics, *, f0_hz, source_name, envelope=None, movement=None):
+def _patch_doc(patch):
+    """Validates a {schema id: value} patch and returns its file form."""
+    doc = {}
+    for identifier, value in patch.items():
+        info = param_info(identifier)  # raises for an unknown id
+        value = float(value)
+        if not info["min"] <= value <= info["max"]:
+            raise ValueError(f"{identifier} = {value} is outside "
+                             f"{info['min']}..{info['max']}")
+        doc[identifier] = {"index": int(info["index"]), "value": round(value, 6)}
+    return doc
+
+
+def read_attack(path):
+    """The attack spectrum, or None for a file without one."""
+    doc = json.loads(Path(path).read_text())
+    block = doc.get("harmonics_attack")
+    if block is None:
+        return None
+    attack = np.asarray(block, dtype=np.float32)
+    if attack.shape != (HARMONICS,):
+        raise ValueError(f"expected {HARMONICS} attack harmonics, got {attack.shape}")
+    return attack
+
+
+def read_patch(path):
+    """The patch as {schema id: value}, or None for a file without one."""
+    doc = json.loads(Path(path).read_text())
+    block = doc.get("patch")
+    if block is None:
+        return None
+    patch = {}
+    for identifier, entry in block.items():
+        info = param_info(identifier)
+        value = float(entry["value"])
+        if int(entry["index"]) != int(info["index"]):
+            raise ValueError(f"{identifier}: index {entry['index']} does not match the schema")
+        if not info["min"] <= value <= info["max"]:
+            raise ValueError(f"{identifier} = {value} is outside {info['min']}..{info['max']}")
+        patch[identifier] = value
+    return patch
+
+
+def write_timbre(path, harmonics, *, f0_hz, source_name, envelope=None, movement=None,
+                 patch=None, attack_harmonics=None):
     harmonics = np.asarray(harmonics, dtype=np.float32)
     if harmonics.shape != (HARMONICS,):
         raise ValueError(f"expected {HARMONICS} harmonics, got {harmonics.shape}")
@@ -62,6 +117,13 @@ def write_timbre(path, harmonics, *, f0_hz, source_name, envelope=None, movement
         doc["envelope"] = [round(float(e), 6) for e in env]
     if movement is not None:
         doc["movement"] = _movement_doc(movement)
+    if patch is not None:
+        doc["patch"] = _patch_doc(patch)
+    if attack_harmonics is not None:
+        attack = np.asarray(attack_harmonics, dtype=np.float32)
+        if attack.shape != (HARMONICS,):
+            raise ValueError(f"expected {HARMONICS} attack harmonics, got {attack.shape}")
+        doc["harmonics_attack"] = [round(float(h), 6) for h in attack]
     Path(path).write_text(json.dumps(doc, indent=2) + "\n")
 
 

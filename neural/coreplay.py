@@ -34,19 +34,28 @@ class _SynthMovement(ctypes.Structure):
     ]
 
 
-_SCHEMA_INDEX = None
+_SCHEMA = None
+
+
+def param_info(identifier):
+    """The schema entry (index, min, max, default, ...) for a parameter id.
+
+    The schema is read once and cached. This is the only place Python reads
+    parameter ranges, so nothing is hand-numbered.
+    """
+    global _SCHEMA
+    if _SCHEMA is None:
+        entries = json.loads(SCHEMA_PATH.read_text())["parameters"]
+        _SCHEMA = {entry["id"]: entry for entry in entries}
+    try:
+        return _SCHEMA[identifier]
+    except KeyError:
+        raise KeyError(f"no parameter {identifier!r} in {SCHEMA_PATH.name}") from None
 
 
 def param_index(identifier):
-    """Index of a parameter by its stable id, read from the schema once and cached."""
-    global _SCHEMA_INDEX
-    if _SCHEMA_INDEX is None:
-        entries = json.loads(SCHEMA_PATH.read_text())["parameters"]
-        _SCHEMA_INDEX = {entry["id"]: int(entry["index"]) for entry in entries}
-    try:
-        return _SCHEMA_INDEX[identifier]
-    except KeyError:
-        raise KeyError(f"no parameter {identifier!r} in {SCHEMA_PATH.name}") from None
+    """Index of a parameter by its stable id (its AU address)."""
+    return int(param_info(identifier)["index"])
 
 
 def _load_library(path=LIB_PATH):
@@ -68,6 +77,10 @@ def _load_library(path=LIB_PATH):
                                             ctypes.c_int, ctypes.POINTER(ctypes.c_float), ctypes.c_int]
     lib.synth_set_timbre_moving.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_float),
                                             ctypes.c_int, ctypes.POINTER(_SynthMovement)]
+    lib.synth_set_timbre_full.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_float),
+                                          ctypes.c_int, ctypes.POINTER(ctypes.c_float), ctypes.c_int,
+                                          ctypes.POINTER(ctypes.c_float), ctypes.c_int,
+                                          ctypes.POINTER(_SynthMovement)]
     lib.synth_note_on.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
     lib.synth_note_off.argtypes = [ctypes.c_void_p, ctypes.c_int]
     lib.synth_render.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_float), ctypes.c_int]
@@ -126,6 +139,30 @@ class Core:
         e = np.ascontiguousarray(envelope, dtype=np.float32)
         self.lib.synth_set_timbre_shaped(self.handle, _float_ptr(h), int(h.size),
                                          _float_ptr(e), int(e.size))
+
+    def set_timbre_full(self, harmonics, attack, movement):
+        """Sustain harmonics, an optional attack spectrum (None for none), and movement."""
+        h = np.ascontiguousarray(harmonics, dtype=np.float32)
+        if attack is None:
+            a_ptr, a_n = None, 0
+            attack_keep = None
+        else:
+            attack_keep = np.ascontiguousarray(attack, dtype=np.float32)
+            a_ptr, a_n = _float_ptr(attack_keep), int(attack_keep.size)
+        track = None
+        keep = []
+        if movement is not None:
+            amp = np.ascontiguousarray(movement.amp, dtype=np.float32)
+            pitch = np.ascontiguousarray(movement.pitch_cents, dtype=np.float32)
+            bright = np.ascontiguousarray(movement.brightness_oct, dtype=np.float32)
+            keep = [amp, pitch, bright]
+            track = _SynthMovement(frameCount=int(min(amp.size, pitch.size, bright.size)),
+                                   loopStart=int(movement.loop_start),
+                                   loopEnd=int(movement.loop_end),
+                                   amp=_float_ptr(amp), pitchCents=_float_ptr(pitch),
+                                   brightnessOct=_float_ptr(bright))
+        self.lib.synth_set_timbre_full(self.handle, _float_ptr(h), int(h.size), a_ptr, a_n,
+                                       None, 0, ctypes.byref(track) if track is not None else None)
 
     def set_timbre_moving(self, harmonics, movement):
         """`movement` is a neural.movement.Movement, or None for no movement."""

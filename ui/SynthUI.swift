@@ -61,6 +61,23 @@ final class SynthModel: ObservableObject {
         sendParam?(index, value)
     }
 
+    /// Step 2d: the controls before a fitted patch (A) and with it applied (B).
+    /// Both are nil when the current timbre has no patch.
+    @Published var fitSource: [Float]?
+    @Published var fitPatch: [Float]?
+    /// True while the fitted patch is the one playing.
+    @Published var fitAB = false
+
+    /// Switches between the source controls and the fitted patch.
+    func toggleFit() {
+        guard let source = fitSource, let fitted = fitPatch else { return }
+        fitAB.toggle()
+        let target = fitAB ? fitted : source
+        for (index, value) in target.enumerated() where params[index] != value {
+            setParam(index, value)
+        }
+    }
+
     /// `note` is the key's position (C4 to C5); the octave shift is applied here.
     func noteOn(_ note: Int) {
         guard !heldNotes.contains(note) else { return }
@@ -447,6 +464,7 @@ struct ContentView: View {
                         knob("cutoff", Int(SYNTH_PARAM_FILTER_CUTOFF), Theme.mid)
                         knob("res", Int(SYNTH_PARAM_FILTER_RESONANCE), Theme.mid)
                         knob("env", Int(SYNTH_PARAM_FILTER_ENV_AMOUNT), Theme.mid)
+                        knob("mode", Int(SYNTH_PARAM_FILTER_MODE), Theme.mid)
                     }
                 }
             }
@@ -481,6 +499,8 @@ struct ContentView: View {
                 Panel(title: "source") {
                     HStack {
                         knob("move", Int(SYNTH_PARAM_MOVEMENT), Theme.hi, size: 40)
+                        knob("attack", Int(SYNTH_PARAM_SPECTRAL_AMOUNT), Theme.hi)
+                        knob("attack t", Int(SYNTH_PARAM_SPECTRAL_TIME), Theme.hi)
                     }
                 }
 
@@ -553,6 +573,10 @@ struct ContentView: View {
                 .font(Theme.font(10))
                 .foregroundStyle(Theme.dim)
                 .frame(width: 80, alignment: .trailing)
+            if model.fitPatch != nil {
+                Button(model.fitAB ? "A/B · fit" : "A/B · source") { model.toggleFit() }
+                    .font(Theme.font(10, .medium))
+            }
             Text(model.status.lowercased())
                 .font(Theme.font(10))
                 .foregroundStyle(Theme.hi)
