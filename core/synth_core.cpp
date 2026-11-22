@@ -1,5 +1,6 @@
 #include "synth_core.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <vector>
@@ -42,6 +43,8 @@ const SynthParamInfo kParams[SYNTH_PARAM_COUNT] = {
     {"reverb_size",  "Reverb Size",  SYNTH_PARAM_CONTINUOUS, 0.0f, 1.0f, 0.5f},
     // Neural source. Defaults to 0 so the oscillators alone make the sound.
     {"source_mix",   "Source Mix",   SYNTH_PARAM_CONTINUOUS, 0.0f, 1.0f, 0.0f},
+    // Movement of the neural source. Defaults to full, so a timbre with movement plays it.
+    {"movement",     "Movement",     SYNTH_PARAM_CONTINUOUS, 0.0f, 1.0f, 1.0f},
 };
 
 const double kMinCutoffHz = 20.0;
@@ -209,6 +212,12 @@ struct CombFilter {
         store = 0.0;
     }
 
+    void clear() {
+        std::fill(buf.begin(), buf.end(), 0.0);
+        idx = 0;
+        store = 0.0;
+    }
+
     double process(double input, double feedback, double damp) {
         const double out = buf[idx];
         store = out * (1.0 - damp) + store * damp;
@@ -224,6 +233,11 @@ struct AllpassFilter {
 
     void resize(int n) {
         buf.assign(static_cast<size_t>(n), 0.0);
+        idx = 0;
+    }
+
+    void clear() {
+        std::fill(buf.begin(), buf.end(), 0.0);
         idx = 0;
     }
 
@@ -250,6 +264,11 @@ struct Reverb {
         for (int i = 0; i < 4; ++i) {
             allpasses[i].resize(static_cast<int>(kAllpassTunings[i] * scale));
         }
+    }
+
+    void clear() {
+        for (auto& c : combs) c.clear();
+        for (auto& a : allpasses) a.clear();
     }
 
     // Returns the wet signal only. The caller mixes it with the dry signal.
@@ -280,6 +299,13 @@ struct TimbreSet {
     // Loudness over the note (see synth_set_timbre_shaped). envCount 0 = no envelope.
     float envelope[SYNTH_TIMBRE_MAX_ENV_POINTS] = {};
     int envCount = 0;
+    // Movement tracks (see synth_set_timbre_moving). moveFrames 0 = no movement.
+    float moveAmp[SYNTH_MOVEMENT_MAX_FRAMES] = {};
+    float movePitch[SYNTH_MOVEMENT_MAX_FRAMES] = {};
+    float moveBright[SYNTH_MOVEMENT_MAX_FRAMES] = {};
+    int moveFrames = 0;
+    int moveLoopStart = 0;
+    int moveLoopEnd = 0;
 };
 
 // Copies an envelope into `set`. A null or empty envelope clears it.
@@ -291,6 +317,70 @@ void set_envelope(TimbreSet& set, const float* envelope, int count) {
     if (count > SYNTH_TIMBRE_MAX_ENV_POINTS) count = SYNTH_TIMBRE_MAX_ENV_POINTS;
     for (int k = 0; k < count; ++k) set.envelope[k] = envelope[k];
     set.envCount = count;
+}
+
+// Copies movement tracks into `set`. A null movement, or one with missing tracks
+// or no frames, clears it. An invalid loop region falls back to the whole clip.
+void set_movement(TimbreSet& set, const SynthMovement* m) {
+    if (!m || m->frameCount <= 0 || !m->amp || !m->pitchCents || !m->brightnessOct) {
+        set.moveFrames = 0;
+        return;
+    }
+    const int n = m->frameCount > SYNTH_MOVEMENT_MAX_FRAMES ? SYNTH_MOVEMENT_MAX_FRAMES : m->frameCount;
+    for (int k = 0; k < n; ++k) {
+        set.moveAmp[k] = m->amp[k];
+        set.movePitch[k] = m->pitchCents[k];
+        set.moveBright[k] = m->brightnessOct[k];
+    }
+    set.moveFrames = n;
+    int ls = m->loopStart, le = m->loopEnd;
+    if (ls < 0 || le > n || le <= ls) {
+        ls = 0;
+        le = n;
+    }
+    set.moveLoopStart = ls;
+    set.moveLoopEnd = le;
+}
+
+// Copies the movement tracks of `src` into `dst`.
+void copy_movement(TimbreSet& dst, const TimbreSet& src) {
+    const int n = src.moveFrames;
+    if (n <= 0) {
+        dst.moveFrames = 0;
+        return;
+    }
+    for (int k = 0; k < n; ++k) {
+        dst.moveAmp[k] = src.moveAmp[k];
+        dst.movePitch[k] = src.movePitch[k];
+        dst.moveBright[k] = src.moveBright[k];
+    }
+    dst.moveFrames = n;
+    dst.moveLoopStart = src.moveLoopStart;
+    dst.moveLoopEnd = src.moveLoopEnd;
+}
+
+// The three movement values at one frame position (linearly interpolated).
+struct MovementPoint {
+    double amp;
+    double pitchCents;
+    double brightnessOct;
+};
+
+// Movement at frame position `frame` (0 = note-on). Frames before the loop play
+// once; from loopStart on, positions wrap inside [loopStart, loopEnd).
+MovementPoint movement_point(const TimbreSet& set, double frame) {
+    const int ls = set.moveLoopStart;
+    const int le = set.moveLoopEnd;
+    double p = frame;
+    if (p >= le) p = ls + std::fmod(p - ls, static_cast<double>(le - ls));
+    int i0 = static_cast<int>(p);
+    if (i0 >= le) i0 = le - 1;
+    if (i0 < 0) i0 = 0;
+    const double f = p - i0;
+    int i1 = i0 + 1;
+    if (i1 >= le) i1 = ls;
+    auto lerp = [f, i0, i1](const float* t) { return t[i0] + f * (t[i1] - t[i0]); };
+    return {lerp(set.moveAmp), lerp(set.movePitch), lerp(set.moveBright)};
 }
 
 // Level of the envelope at `t`, where t = 0 is note-on and t = 1 is the end of
@@ -477,6 +567,13 @@ void synth_destroy(SynthCore* core) {
     delete core;
 }
 
+void synth_reset(SynthCore* core) {
+    if (!core) return;
+    for (auto& v : core->voices) v = Voice();
+    core->lfoPhase = 0.0;
+    core->reverb.clear();
+}
+
 void synth_set_sample_rate(SynthCore* core, double sample_rate) {
     if (!core) return;
     core->sampleRate = sample_rate;
@@ -488,13 +585,14 @@ void synth_set_sample_rate(SynthCore* core, double sample_rate) {
         const TimbreSet& old = core->timbreSets[front];
         build_timbre(core->timbreSets[back], old.harmonics, SYNTH_TIMBRE_MAX_HARMONICS, sample_rate);
         set_envelope(core->timbreSets[back], old.envelope, old.envCount);
+        copy_movement(core->timbreSets[back], old);
         core->timbreFront.store(back, std::memory_order_release);
     }
 }
 
-void synth_set_timbre_shaped(SynthCore* core, const float* harmonics, int count,
-                             const float* envelope, int envCount) {
-    if (!core) return;
+// Builds a timbre into the back set and publishes it. Shared by the setters below.
+void publish_timbre(SynthCore* core, const float* harmonics, int count,
+                    const float* envelope, int envCount, const SynthMovement* movement) {
     if (count <= 0 || !harmonics) {
         core->timbreFront.store(-1, std::memory_order_release);
         return;
@@ -504,7 +602,20 @@ void synth_set_timbre_shaped(SynthCore* core, const float* harmonics, int count,
     const int back = front == 0 ? 1 : 0;
     build_timbre(core->timbreSets[back], harmonics, count, core->sampleRate);
     set_envelope(core->timbreSets[back], envelope, envCount);
+    set_movement(core->timbreSets[back], movement);
     core->timbreFront.store(back, std::memory_order_release);
+}
+
+void synth_set_timbre_shaped(SynthCore* core, const float* harmonics, int count,
+                             const float* envelope, int envCount) {
+    if (!core) return;
+    publish_timbre(core, harmonics, count, envelope, envCount, nullptr);
+}
+
+void synth_set_timbre_moving(SynthCore* core, const float* harmonics, int count,
+                             const SynthMovement* movement) {
+    if (!core) return;
+    publish_timbre(core, harmonics, count, nullptr, 0, movement);
 }
 
 void synth_set_timbre(SynthCore* core, const float* harmonics, int count) {
@@ -595,6 +706,7 @@ void synth_render(SynthCore* core, float* out, int frames) {
     const double sourceMix = std::fmin(std::fmax(load(SYNTH_PARAM_SOURCE_MIX), 0.0), 1.0);
     const int timbreIndex = core->timbreFront.load(std::memory_order_acquire);
     const TimbreSet* timbre = timbreIndex >= 0 ? &core->timbreSets[timbreIndex] : nullptr;
+    const double movement = std::fmin(std::fmax(load(SYNTH_PARAM_MOVEMENT), 0.0), 1.0);
 
     // Envelope steps, once per block.
     const double ampAttack = env_step(static_cast<float>(load(SYNTH_PARAM_ENV_ATTACK)), sr);
@@ -627,18 +739,29 @@ void synth_render(SynthCore* core, float* out, int frames) {
                                   levelB * v.oscB.next(waveB, cpsB);
             // Neural source follows osc A's pitch, including detune and vibrato.
             double raw = (1.0 - sourceMix) * oscMix;
+            double brightOct = 0.0;  // movement brightness offset for this voice's filter
             if (sourceMix > 0.0 && timbre) {
                 double gain = 1.0;
-                if (timbre->envCount > 0) {
+                double pitchCents = 0.0;
+                if (timbre->moveFrames > 0) {
+                    // Movement replaces the envelope. Frame 0 is note-on, at SYNTH_MOVEMENT_RATE_HZ.
+                    const MovementPoint at = movement_point(
+                        *timbre, v.envSamples * SYNTH_MOVEMENT_RATE_HZ / sr);
+                    gain = 1.0 + movement * (at.amp - 1.0);
+                    pitchCents = movement * at.pitchCents;
+                    brightOct = sourceMix * movement * at.brightnessOct;
+                } else if (timbre->envCount > 0) {
                     gain = envelope_at(*timbre, v.envSamples / (SYNTH_TIMBRE_ENV_SECONDS * sr));
                 }
-                raw += sourceMix * gain * read_timbre(*timbre, cpsA * sr, cpsA, v.tablePhase);
+                const double cpsN = cpsA * std::exp2(pitchCents / 1200.0);
+                raw += sourceMix * gain * read_timbre(*timbre, cpsN * sr, cpsN, v.tablePhase);
             }
             v.envSamples += 1.0;
 
-            // Filter: base cutoff, opened by this voice's envelope and moved by the LFO.
+            // Filter: base cutoff, opened by this voice's envelope, moved by the LFO
+            // and by the source's brightness movement.
             double cutoff = baseCutoffHz *
-                            std::exp2(filterEnvOctaves * v.filterEnv.level + lfoFilterOctaves * lfo);
+                            std::exp2(filterEnvOctaves * v.filterEnv.level + lfoFilterOctaves * lfo + brightOct);
             cutoff = std::fmin(std::fmax(cutoff, kMinCutoffHz), 0.45 * sr);
             const double g = std::tan(kPi * cutoff / sr);
             const double filtered = v.filter.process(raw, g, k);

@@ -107,7 +107,7 @@ static float cutoff_for_hz(double hz) {
 int main() {
     std::printf("Filter schema and cutoff mapping\n");
     {
-        CHECK(synth_param_count() == 24, "24 parameters: osc, filter, envelopes, LFO, effects and source mix");
+        CHECK(synth_param_count() == 25, "25 parameters: osc, filter, envelopes, LFO, effects, source mix and movement");
         CHECK(std::strcmp(synth_param_info(SYNTH_PARAM_REVERB_MIX).id, "reverb_mix") == 0,
               "reverb mix id");
         CHECK(synth_param_info(SYNTH_PARAM_OSC_A_DETUNE).min == -100.0f, "detune range is +/-100 cents");
@@ -598,6 +598,182 @@ int main() {
         synth_render(s, after.data(), kSecond / 4);
         CHECK(peak(after) > 0.05, "timbre still sounds after a sample-rate change");
         synth_destroy(s);
+    }
+
+    std::printf("Neural source: movement (step 2c)\n");
+    {
+        const int kFrameSamples = static_cast<int>(kSR / SYNTH_MOVEMENT_RATE_HZ);  // 960 at 48 kHz
+        const int kFrames = 50;
+        const float sine[1] = {1.0f};
+        float saw[32];
+        for (int k = 0; k < 32; ++k) saw[k] = 1.0f / static_cast<float>(k + 1);
+
+        // Level of the sound in the middle half of one 20 ms frame.
+        auto frame_rms = [kFrameSamples](const std::vector<float>& x, int frame) {
+            const int a = frame * kFrameSamples + kFrameSamples / 4;
+            const int b = frame * kFrameSamples + 3 * kFrameSamples / 4;
+            double acc = 0.0;
+            for (int i = a; i < b; ++i) acc += static_cast<double>(x[i]) * x[i];
+            return std::sqrt(acc / (b - a));
+        };
+        auto render = [](SynthCore* s, int frames) {
+            std::vector<float> out(frames);
+            synth_render(s, out.data(), frames);
+            return out;
+        };
+
+        // Loop and wrap: frames 0-9 play once, frames 10-29 loop, frames 30-49 are never played.
+        std::vector<float> amp(kFrames), zeros(kFrames, 0.0f);
+        for (int k = 0; k < kFrames; ++k) amp[k] = k < 10 ? 1.0f : (k < 30 ? 0.25f : 0.75f);
+        SynthMovement loop = {kFrames, 10, 30, amp.data(), zeros.data(), zeros.data()};
+        SynthCore* s = synth_create(kSR);
+        synth_set_timbre_moving(s, sine, 1, &loop);
+        synth_set_param(s, SYNTH_PARAM_SOURCE_MIX, 1.0f);
+        synth_note_on(s, 69, 127);
+        const std::vector<float> looped = render(s, 2 * kSecond);
+        synth_destroy(s);
+        const double r5 = frame_rms(looped, 5), r25 = frame_rms(looped, 25);
+        const double r35 = frame_rms(looped, 35), r45 = frame_rms(looped, 45);
+        CHECK(std::fabs(r25 / r5 - 0.25) < 0.03, "amp track sets the level: frame 25 is a quarter of frame 5");
+        CHECK(std::fabs(r35 / r25 - 1.0) < 0.03, "playback wraps to loopStart after loopEnd (frame 35 repeats frame 25)");
+        CHECK(std::fabs(r45 / r25 - 1.0) < 0.03, "the loop keeps repeating (frame 45 repeats frame 25)");
+        CHECK(r35 / r5 < 0.35, "frames after loopEnd (level 0.75) are never played");
+
+        // Pitch track: +100 cents raises A4 to 466 Hz. Movement 0 leaves it at 440 Hz.
+        std::vector<float> ones(kFrames, 1.0f), cents(kFrames, 100.0f);
+        SynthMovement pitched = {kFrames, 0, kFrames, ones.data(), cents.data(), zeros.data()};
+        s = synth_create(kSR);
+        synth_set_timbre_moving(s, sine, 1, &pitched);
+        synth_set_param(s, SYNTH_PARAM_SOURCE_MIX, 1.0f);
+        synth_note_on(s, 69, 127);
+        const std::vector<float> up = render(s, kSecond);
+        CHECK(std::fabs(estimate_hz(up, kSR) - 466.16) < 2.0, "pitch track +100 cents raises A4 to 466 Hz");
+        synth_destroy(s);
+        s = synth_create(kSR);
+        synth_set_timbre_moving(s, sine, 1, &pitched);
+        synth_set_param(s, SYNTH_PARAM_SOURCE_MIX, 1.0f);
+        synth_set_param(s, SYNTH_PARAM_MOVEMENT, 0.0f);
+        synth_note_on(s, 69, 127);
+        const std::vector<float> still = render(s, kSecond);
+        CHECK(std::fabs(estimate_hz(still, kSR) - 440.0) < 1.0, "movement 0 ignores the pitch track (440 Hz)");
+        synth_destroy(s);
+
+        // Brightness track: -4 octaves closes the filter, so a saw loses its upper harmonics.
+        std::vector<float> dark(kFrames, -4.0f);
+        SynthMovement brightTrack = {kFrames, 0, kFrames, ones.data(), zeros.data(), dark.data()};
+        s = synth_create(kSR);
+        synth_set_timbre_moving(s, saw, 32, &brightTrack);
+        synth_set_param(s, SYNTH_PARAM_SOURCE_MIX, 1.0f);
+        synth_note_on(s, 69, 127);
+        const std::vector<float> closed = render(s, kSecond);
+        synth_destroy(s);
+        s = synth_create(kSR);
+        synth_set_timbre(s, saw, 32);
+        synth_set_param(s, SYNTH_PARAM_SOURCE_MIX, 1.0f);
+        synth_note_on(s, 69, 127);
+        const std::vector<float> open = render(s, kSecond);
+        synth_destroy(s);
+        CHECK(rms(closed) < rms(open) * 0.95, "brightness track -4 octaves lowers the filtered level");
+
+        // Movement 0 is the same as no movement: any tracks, bit for bit.
+        std::vector<float> quiet(kFrames, 0.3f), sharp(kFrames, 200.0f), dim(kFrames, -2.0f);
+        SynthMovement busy = {kFrames, 5, 40, quiet.data(), sharp.data(), dim.data()};
+        SynthCore* withTracks = synth_create(kSR);
+        synth_set_timbre_moving(withTracks, saw, 32, &busy);
+        synth_set_param(withTracks, SYNTH_PARAM_SOURCE_MIX, 1.0f);
+        synth_set_param(withTracks, SYNTH_PARAM_MOVEMENT, 0.0f);
+        SynthCore* plain = synth_create(kSR);
+        synth_set_timbre(plain, saw, 32);
+        synth_set_param(plain, SYNTH_PARAM_SOURCE_MIX, 1.0f);
+        synth_note_on(withTracks, 69, 127);
+        synth_note_on(plain, 69, 127);
+        const std::vector<float> a = render(withTracks, kSecond / 2);
+        const std::vector<float> b = render(plain, kSecond / 2);
+        CHECK(a == b, "movement 0 is bit-identical to a timbre without movement");
+
+        // A timbre without movement ignores the Movement parameter.
+        synth_destroy(withTracks);
+        synth_destroy(plain);
+        SynthCore* noMove = synth_create(kSR);
+        synth_set_timbre(noMove, saw, 32);
+        synth_set_param(noMove, SYNTH_PARAM_SOURCE_MIX, 1.0f);
+        synth_set_param(noMove, SYNTH_PARAM_MOVEMENT, 0.0f);
+        synth_note_on(noMove, 69, 127);
+        const std::vector<float> c = render(noMove, kSecond / 2);
+        synth_destroy(noMove);
+        SynthCore* noMove1 = synth_create(kSR);
+        synth_set_timbre(noMove1, saw, 32);
+        synth_set_param(noMove1, SYNTH_PARAM_SOURCE_MIX, 1.0f);
+        synth_note_on(noMove1, 69, 127);
+        const std::vector<float> d = render(noMove1, kSecond / 2);
+        synth_destroy(noMove1);
+        CHECK(c == d, "a timbre without movement sounds the same at any Movement setting");
+
+        // Movement survives a sample-rate change...
+        SynthCore* moved = synth_create(kSR);
+        synth_set_timbre_moving(moved, saw, 32, &busy);
+        synth_set_param(moved, SYNTH_PARAM_SOURCE_MIX, 1.0f);
+        synth_set_sample_rate(moved, kSR);
+        synth_note_on(moved, 69, 127);
+        const std::vector<float> kept = render(moved, kSecond / 2);
+        CHECK(kept != b, "movement survives a sample-rate change (differs from no movement)");
+        synth_destroy(moved);
+
+        // ...and a plain timbre load clears it.
+        SynthCore* cleared = synth_create(kSR);
+        synth_set_timbre_moving(cleared, saw, 32, &busy);
+        synth_set_timbre(cleared, saw, 32);
+        synth_set_param(cleared, SYNTH_PARAM_SOURCE_MIX, 1.0f);
+        synth_note_on(cleared, 69, 127);
+        const std::vector<float> wiped = render(cleared, kSecond / 2);
+        synth_destroy(cleared);
+        CHECK(wiped == b, "loading a timbre without movement clears the movement");
+    }
+
+    std::printf("Reset: a reset core renders like a fresh one\n");
+    {
+        // Fresh core: one note with vibrato and reverb.
+        SynthCore* fresh = synth_create(kSR);
+        synth_set_param(fresh, SYNTH_PARAM_LFO_PITCH_DEPTH, 50.0f);
+        synth_set_param(fresh, SYNTH_PARAM_REVERB_MIX, 0.5f);
+        synth_set_param(fresh, SYNTH_PARAM_REVERB_SIZE, 1.0f);
+        synth_note_on(fresh, 69, 100);
+        std::vector<float> a(kSecond / 2);
+        synth_render(fresh, a.data(), kSecond / 2);
+        synth_destroy(fresh);
+
+        // Dirty core: loud chord, reverb tail, LFO advanced; then reset and the same note.
+        SynthCore* dirty = synth_create(kSR);
+        synth_set_param(dirty, SYNTH_PARAM_LFO_PITCH_DEPTH, 50.0f);
+        synth_set_param(dirty, SYNTH_PARAM_REVERB_MIX, 0.5f);
+        synth_set_param(dirty, SYNTH_PARAM_REVERB_SIZE, 1.0f);
+        for (int n : {60, 64, 67, 72}) synth_note_on(dirty, n, 127);
+        std::vector<float> junk(kSecond);
+        synth_render(dirty, junk.data(), kSecond);
+        synth_note_off(dirty, 60);
+        synth_note_off(dirty, 64);
+        synth_note_off(dirty, 67);
+        synth_note_off(dirty, 72);
+        synth_render(dirty, junk.data(), kSecond / 2);  // let the reverb ring
+        synth_reset(dirty);
+        synth_note_on(dirty, 69, 100);
+        std::vector<float> b(kSecond / 2);
+        synth_render(dirty, b.data(), kSecond / 2);
+        synth_destroy(dirty);
+        CHECK(a == b, "after reset, the same note is bit-identical to a fresh core");
+        CHECK(peak(a) > 0.01, "the reset comparison note is audible");
+
+        // Reset keeps parameters and the loaded timbre: a sine timbre still plays at 440 Hz.
+        const float sine[1] = {1.0f};
+        SynthCore* kept = synth_create(kSR);
+        synth_set_timbre(kept, sine, 1);
+        synth_set_param(kept, SYNTH_PARAM_SOURCE_MIX, 1.0f);
+        synth_reset(kept);
+        synth_note_on(kept, 69, 127);
+        std::vector<float> tone(kSecond);
+        synth_render(kept, tone.data(), kSecond);
+        synth_destroy(kept);
+        CHECK(std::fabs(estimate_hz(tone, kSR) - 440.0) < 4.4, "reset keeps the loaded timbre");
     }
 
     std::printf("\n%s (%d failure%s)\n", failures ? "FAILED" : "PASSED",

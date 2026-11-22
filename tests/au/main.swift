@@ -96,6 +96,26 @@ func render(_ engine: AVAudioEngine, seconds: Double) throws -> [[Float]] {
 
 func peak(_ x: [Float]) -> Float { x.map { abs($0) }.max() ?? 0 }
 
+/// How much the loudness moves over a held note: the spread (standard deviation over
+/// mean) of 20 ms RMS blocks, after the first 0.5 s so the attack is left out.
+func loudnessSpread(_ x: [Float]) -> Double {
+    let block = Int(sampleRate / 50)
+    let start = Int(sampleRate / 2)
+    var levels: [Double] = []
+    var i = start
+    while i + block <= x.count {
+        var acc = 0.0
+        for j in i..<(i + block) { acc += Double(x[j]) * Double(x[j]) }
+        levels.append((acc / Double(block)).squareRoot())
+        i += block
+    }
+    guard !levels.isEmpty else { return 0 }
+    let mean = levels.reduce(0, +) / Double(levels.count)
+    guard mean > 0 else { return 0 }
+    let variance = levels.reduce(0) { $0 + ($1 - mean) * ($1 - mean) } / Double(levels.count)
+    return variance.squareRoot() / mean
+}
+
 func frequency(_ x: [Float]) -> Double {
     var crossings = 0
     for i in 1..<x.count where x[i - 1] <= 0 && x[i] > 0 { crossings += 1 }
@@ -163,7 +183,7 @@ do {
         (15, "filter_env_sustain"), (16, "filter_env_release"),
         (17, "lfo_rate"), (18, "lfo_pitch_depth"), (19, "lfo_filter_depth"),
         (20, "drive"), (21, "reverb_mix"), (22, "reverb_size"),
-        (23, "source_mix"),
+        (23, "source_mix"), (24, "movement"),
     ]
     for (address, identifier) in expected {
         check(tree.parameter(withAddress: address)?.identifier == identifier,
@@ -252,6 +272,52 @@ do {
     let earlyRMS = rms(Array(envOut[0..<eighth]))
     let lateRMS = rms(Array(envOut[(envOut.count - eighth)...]))
     check(lateRMS > 4 * earlyRMS, "a rising envelope through fullState makes the late note louder")
+
+    // Full pipeline: a real timbre file (version 3, from neural.export on a clip with
+    // a known tremolo), loaded the way the host loads it. The test script makes the file.
+    if let path = ProcessInfo.processInfo.environment["TIMBRE_JSON"] {
+        print("Full pipeline: imported timbre with movement")
+        let data = try Data(contentsOf: URL(fileURLWithPath: path))
+        let doc = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+        let harmonics = (doc["harmonics"] as! [Double]).map { Float($0) }
+        let block = doc["movement"] as! [String: Any]
+        let movement = TimbreMovement(
+            loopStart: block["loop_start"] as! Int,
+            loopEnd: block["loop_end"] as! Int,
+            amp: (block["amp"] as! [Double]).map { Float($0) },
+            pitchCents: (block["pitch_cents"] as! [Double]).map { Float($0) },
+            brightnessOct: (block["brightness_oct"] as! [Double]).map { Float($0) })
+
+        // Movement 1: the source's loudness moves, and the note is audible.
+        let (engineOn, hostOn) = try makeHost()
+        (hostOn.auAudioUnit as! SynthAudioUnit).loadTimbre(harmonics, movement: movement)
+        _ = sendMIDI(hostOn, 0x90, 69, 127)
+        let moving = try render(engineOn, seconds: 3.0)[0]
+        check(peak(moving) > 0.05, "imported timbre is audible (peak \(String(format: "%.3f", peak(moving))))")
+        let movingSpread = loudnessSpread(moving)
+        check(movingSpread > 0.1, "movement 1: loudness moves with the source (spread \(String(format: "%.3f", movingSpread)))")
+
+        // Movement 0: the same timbre holds still.
+        let (engineOff, hostOff) = try makeHost()
+        (hostOff.auAudioUnit as! SynthAudioUnit).loadTimbre(harmonics, movement: movement)
+        hostOff.auAudioUnit.parameterTree?.parameter(withAddress: 24)?.value = 0
+        _ = sendMIDI(hostOff, 0x90, 69, 127)
+        let still = try render(engineOff, seconds: 3.0)[0]
+        let stillSpread = loudnessSpread(still)
+        check(stillSpread < 0.05, "movement 0: the same timbre holds still (spread \(String(format: "%.3f", stillSpread)))")
+
+        // The host route: harmonics and movement through fullState, as SynthHostApp.apply writes them.
+        let (engineF, hostF) = try makeHost()
+        var movingState = hostF.auAudioUnit.fullState ?? [:]
+        movingState[synthTimbreStateKey] = harmonics.map { Double($0) }
+        movingState[synthTimbreMovementStateKey] = movement.stateValue
+        hostF.auAudioUnit.fullState = movingState
+        hostF.auAudioUnit.parameterTree?.parameter(withAddress: 23)?.value = 1
+        _ = sendMIDI(hostF, 0x90, 69, 127)
+        let viaState = try render(engineF, seconds: 3.0)[0]
+        check(peak(viaState) > 0.05, "imported timbre set through fullState is audible")
+        check(loudnessSpread(viaState) > 0.1, "fullState route: loudness moves with the source")
+    }
 
     let out = CommandLine.arguments.count > 1 ? CommandLine.arguments[1] : "build/au_output.wav"
     try writeWAV(tone, to: out)

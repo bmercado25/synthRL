@@ -28,13 +28,33 @@ final class SynthKernel {
         synth_set_param(core, Int32(index), value)
     }
 
-    /// Builds the neural-source wavetables and loudness envelope in one step.
-    /// An empty envelope means full level. Not real-time safe: call off the audio thread.
-    func setTimbre(_ harmonics: [Float], envelope: [Float]) {
+    /// Builds the neural-source wavetables, and either a loudness envelope or the
+    /// source's movement, in one step. An empty envelope means full level. Movement
+    /// replaces the envelope. Not real-time safe: call off the audio thread.
+    func setTimbre(_ harmonics: [Float], envelope: [Float], movement: TimbreMovement? = nil) {
+        guard let movement else {
+            harmonics.withUnsafeBufferPointer { h in
+                envelope.withUnsafeBufferPointer { e in
+                    synth_set_timbre_shaped(core, h.baseAddress, Int32(h.count),
+                                            e.baseAddress, Int32(e.count))
+                }
+            }
+            return
+        }
         harmonics.withUnsafeBufferPointer { h in
-            envelope.withUnsafeBufferPointer { e in
-                synth_set_timbre_shaped(core, h.baseAddress, Int32(h.count),
-                                        e.baseAddress, Int32(e.count))
+            movement.amp.withUnsafeBufferPointer { a in
+                movement.pitchCents.withUnsafeBufferPointer { p in
+                    movement.brightnessOct.withUnsafeBufferPointer { b in
+                        var track = SynthMovement(
+                            frameCount: Int32(min(a.count, p.count, b.count)),
+                            loopStart: Int32(movement.loopStart),
+                            loopEnd: Int32(movement.loopEnd),
+                            amp: a.baseAddress,
+                            pitchCents: p.baseAddress,
+                            brightnessOct: b.baseAddress)
+                        synth_set_timbre_moving(core, h.baseAddress, Int32(h.count), &track)
+                    }
+                }
             }
         }
     }
@@ -76,15 +96,54 @@ func makeSynthParameters() -> [AUParameter] {
     }
 }
 
-/// Keys under which the timbre and its loudness envelope are stored in AUAudioUnit.fullState.
+/// Keys under which the timbre, its loudness envelope and its movement are stored in AUAudioUnit.fullState.
 let synthTimbreStateKey = "synthTimbre"
 let synthTimbreEnvelopeStateKey = "synthTimbreEnvelope"
+let synthTimbreMovementStateKey = "synthTimbreMovement"
+
+/// The source's movement (step 2c): loudness, pitch and brightness tracks on a
+/// 50 Hz grid, and the loop region in frames. Same layout as the "movement" block
+/// of a timbre file.
+public struct TimbreMovement {
+    public var loopStart: Int
+    public var loopEnd: Int
+    public var amp: [Float]
+    public var pitchCents: [Float]
+    public var brightnessOct: [Float]
+
+    public init(loopStart: Int, loopEnd: Int, amp: [Float], pitchCents: [Float], brightnessOct: [Float]) {
+        self.loopStart = loopStart
+        self.loopEnd = loopEnd
+        self.amp = amp
+        self.pitchCents = pitchCents
+        self.brightnessOct = brightnessOct
+    }
+
+    /// Property-list form, for AUAudioUnit.fullState (and so for presets).
+    var stateValue: [String: Any] {
+        ["loopStart": Double(loopStart), "loopEnd": Double(loopEnd),
+         "amp": amp.map { Double($0) }, "pitchCents": pitchCents.map { Double($0) },
+         "brightnessOct": brightnessOct.map { Double($0) }]
+    }
+
+    init?(stateValue: [String: Any]) {
+        guard let start = stateValue["loopStart"] as? Double,
+              let end = stateValue["loopEnd"] as? Double,
+              let amp = stateValue["amp"] as? [Double],
+              let pitch = stateValue["pitchCents"] as? [Double],
+              let bright = stateValue["brightnessOct"] as? [Double] else { return nil }
+        self.init(loopStart: Int(start), loopEnd: Int(end),
+                  amp: amp.map { Float($0) }, pitchCents: pitch.map { Float($0) },
+                  brightnessOct: bright.map { Float($0) })
+    }
+}
 
 @objc(SynthAudioUnit)
 public final class SynthAudioUnit: AUAudioUnit {
     private let kernel = SynthKernel()
     private var timbreValues: [Float] = []
     private var timbreEnvelope: [Float] = []
+    private var timbreMovement: TimbreMovement?
     private var outputBus: AUAudioUnitBus!
     private var outputBusArray: AUAudioUnitBusArray!
 
@@ -109,12 +168,13 @@ public final class SynthAudioUnit: AUAudioUnit {
     }
 
     /// Loads a neural-source timbre (harmonic amplitudes, fundamental first), with an
-    /// optional loudness envelope over the note, and sets Source Mix to 1 so it is
-    /// heard. Call from the main thread, not the audio thread.
-    public func loadTimbre(_ harmonics: [Float], envelope: [Float] = []) {
+    /// optional loudness envelope over the note or the source's movement, and sets
+    /// Source Mix to 1 so it is heard. Call from the main thread, not the audio thread.
+    public func loadTimbre(_ harmonics: [Float], envelope: [Float] = [], movement: TimbreMovement? = nil) {
         timbreValues = harmonics
         timbreEnvelope = envelope
-        kernel.setTimbre(harmonics, envelope: envelope)
+        timbreMovement = movement
+        kernel.setTimbre(harmonics, envelope: envelope, movement: movement)
         let address = AUParameterAddress(Int(SYNTH_PARAM_SOURCE_MIX))
         parameterTree?.parameter(withAddress: address)?.value = 1
     }
@@ -131,6 +191,9 @@ public final class SynthAudioUnit: AUAudioUnit {
                 if !timbreEnvelope.isEmpty {
                     state[synthTimbreEnvelopeStateKey] = timbreEnvelope.map { Double($0) }
                 }
+                if let movement = timbreMovement {
+                    state[synthTimbreMovementStateKey] = movement.stateValue
+                }
             }
             return state
         }
@@ -138,10 +201,15 @@ public final class SynthAudioUnit: AUAudioUnit {
             super.fullState = newValue
             let stored = (newValue?[synthTimbreStateKey] as? [Double]) ?? []
             let storedEnvelope = (newValue?[synthTimbreEnvelopeStateKey] as? [Double]) ?? []
+            let storedMovement = (newValue?[synthTimbreMovementStateKey] as? [String: Any])
+                .flatMap(TimbreMovement.init(stateValue:))
             timbreValues = stored.map { Float($0) }
             timbreEnvelope = storedEnvelope.map { Float($0) }
-            // An empty harmonic list clears the timbre (and its envelope with it).
-            kernel.setTimbre(timbreValues, envelope: timbreValues.isEmpty ? [] : timbreEnvelope)
+            timbreMovement = storedMovement
+            // An empty harmonic list clears the timbre (with its envelope and movement).
+            kernel.setTimbre(timbreValues,
+                             envelope: timbreValues.isEmpty ? [] : timbreEnvelope,
+                             movement: timbreValues.isEmpty ? nil : timbreMovement)
         }
     }
 

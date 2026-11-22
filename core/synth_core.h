@@ -40,6 +40,7 @@ enum {
     SYNTH_PARAM_REVERB_MIX,        // 0-1: dry/wet
     SYNTH_PARAM_REVERB_SIZE,       // 0-1: room size (decay time)
     SYNTH_PARAM_SOURCE_MIX,        // 0-1: 0 = oscillators, 1 = neural source (timbre from synth_set_timbre)
+    SYNTH_PARAM_MOVEMENT,          // 0-1: 0 = static neural source, 1 = the source's measured movement
     SYNTH_PARAM_COUNT
 };
 
@@ -94,6 +95,12 @@ SynthCore* synth_create(double sample_rate);
 void synth_destroy(SynthCore* core);
 void synth_set_sample_rate(SynthCore* core, double sample_rate);
 
+// Returns the core to its just-created state for rendering: all voices silent,
+// LFO phase zero, reverb tail cleared. Parameters and the loaded timbre are kept.
+// Makes a render depend only on what is played after the reset, so repeated
+// evaluations (sound matching) are deterministic. Off the audio thread.
+void synth_reset(SynthCore* core);
+
 // MIDI-style note control. Velocity 0-127.
 void synth_note_on(SynthCore* core, int note, int velocity);
 void synth_note_off(SynthCore* core, int note);
@@ -119,6 +126,34 @@ void synth_set_timbre(SynthCore* core, const float* harmonics, int count);
 #define SYNTH_TIMBRE_ENV_SECONDS 4.0
 void synth_set_timbre_shaped(SynthCore* core, const float* harmonics, int count,
                              const float* envelope, int envCount);
+
+// Movement of the neural source (step 2c). Tracks are sampled at
+// SYNTH_MOVEMENT_RATE_HZ, one value per frame, frame 0 at note-on. A note plays
+// from frame 0 once through the part before loopStart, then repeats
+// [loopStart, loopEnd) while the key is held. Values at frame positions between
+// two frames are linearly interpolated.
+//   amp           linear loudness, peak 1; the neural source gain is 1 + movement * (amp - 1)
+//   pitchCents    pitch offset of the neural source, in cents
+//   brightnessOct filter cutoff offset in octaves, scaled by Source Mix
+// The Movement parameter scales all three. At 0 the source is static and the
+// result is identical to a timbre without movement. Movement replaces the
+// envelope: a timbre with movement ignores its envelope.
+#define SYNTH_MOVEMENT_MAX_FRAMES 500
+#define SYNTH_MOVEMENT_RATE_HZ 50.0
+typedef struct {
+    int frameCount;                 // 1 to SYNTH_MOVEMENT_MAX_FRAMES
+    int loopStart;                  // frame index, inclusive
+    int loopEnd;                    // frame index, exclusive, greater than loopStart
+    const float* amp;               // frameCount values
+    const float* pitchCents;        // frameCount values
+    const float* brightnessOct;     // frameCount values
+} SynthMovement;
+
+// Sets the timbre together with its movement, published in one step. A null
+// `movement` (or frameCount 0) gives a timbre without movement and no envelope.
+// Off the audio thread, like synth_set_timbre_shaped.
+void synth_set_timbre_moving(SynthCore* core, const float* harmonics, int count,
+                             const SynthMovement* movement);
 
 #ifdef __cplusplus
 }

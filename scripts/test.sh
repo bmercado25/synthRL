@@ -23,6 +23,10 @@ diff -u schema/synth_params.json build/synth_params.json || {
 }
 echo "parameter schema matches schema/synth_params.json"
 
+# The same core as a shared library, so Python renders exactly what the plugin plays
+# (neural/coreplay.py). Built with the Command Line Tools, no Xcode needed.
+clang++ -std=c++17 -O2 -dynamiclib -fPIC core/synth_core.cpp -o build/libsynthcore.dylib
+
 # Python side of the neural source (analysis, timbre files). Needs the venv
 # from CLAUDE.md ("Python environment"); skipped loudly if it is missing.
 echo
@@ -51,5 +55,16 @@ swiftc -O -module-name AUTest \
 if pluginkit -m -i com.synthrl.host.synth >/dev/null 2>&1; then
     pluginkit -e ignore -i com.synthrl.host.synth || true
     trap 'pluginkit -e use -i com.synthrl.host.synth || true' EXIT
+fi
+# Full pipeline for the imported-sample path: a clip with a known tremolo goes
+# through neural.export (analysis + movement, version 3 timbre file), then the AU
+# test loads that file and checks that the plugin plays the movement.
+if [ -x .venv/bin/python ]; then
+    mkdir -p build/pipeline
+    .venv/bin/python -W ignore -m neural.fixtures build/pipeline/tremolo.wav
+    .venv/bin/python -W ignore -m neural.export build/pipeline/tremolo.wav build/pipeline/tremolo_timbre.json
+    export TIMBRE_JSON="$ROOT/build/pipeline/tremolo_timbre.json"
+else
+    echo "SKIPPED imported-timbre pipeline check: no .venv (AU test runs its other checks)"
 fi
 ./build/au_test build/au_output.wav

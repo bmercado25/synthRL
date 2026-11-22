@@ -478,6 +478,12 @@ struct ContentView: View {
                     }
                 }
 
+                Panel(title: "source") {
+                    HStack {
+                        knob("move", Int(SYNTH_PARAM_MOVEMENT), Theme.hi, size: 40)
+                    }
+                }
+
                 Panel(title: "fx") {
                     HStack {
                         knob("drive", Int(SYNTH_PARAM_DRIVE), Theme.mid, size: 40)

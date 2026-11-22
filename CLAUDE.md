@@ -125,6 +125,8 @@ Each phase ends with something testable. Do not start a later phase to avoid a f
 - Parameter schema file location: `schema/synth_params.json`, generated from the core by `tools/export_schema.cpp`. `scripts/test.sh` fails if it is stale
 - Test phrase files location:
 - Python environment: Python 3.12 in `.venv/` at the repo root (`uv venv --python 3.12 .venv`), pinned in `spikes/requirements.lock`. PyTorch 2.15 with MPS (Apple GPU) available. The venv is git-ignored
+- Movement (step 2c): timbre format version 3 carries an optional `movement` block (loudness, pitch and brightness tracks at 50 Hz, max 500 frames, plus a loop region). Measured from the audio by `neural/movement.py`, played by the core behind `SYNTH_PARAM_MOVEMENT` (AU address 24). Movement replaces the envelope when present
+- Python renders through the real core: `neural/coreplay.py` drives `build/libsynthcore.dylib` (built by `scripts/test.sh`). Objective movement check: `python -m neural.movement_eval`
 - Generator model and version:
 
 ## Decision log
@@ -142,3 +144,4 @@ Each phase ends with something testable. Do not start a later phase to avoid a f
 | 2026-11-16 | Human feedback is part of the core loop, not a late phase | KEEP, DISCARD, FAVORITE, MORE/LESS LIKE THIS guide exploration from the start |
 | 2026-11-16 | Presets store the recipe, with optional cached audio | Neural regeneration may not be exactly reproducible |
 | 2026-11-16 | Step 2a is analysis-resynthesis (pYIN f0, harmonic timbre, no training); the trained generator comes after the hand-off works | Proves sample import, the core's neural source path and the host loader end to end before model quality is at stake. Known limit: magnitudes only, no phase or noise |
+| 2026-11-22 | Step 2c carries the source's movement (loudness, pitch, brightness and a looped phrase) into the synth, measured from the audio and played in the core behind a Movement control. Analysis only, no retrain | The decoder's envelope was predicted, not measured, and the encoder pools over time, so imported sounds lost their cadence and wobble. Movement loops while a key is held. Pitch is measured with a 1024-sample pYIN window, since 2048 halves a 5 Hz vibrato's depth |

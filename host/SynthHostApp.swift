@@ -30,7 +30,7 @@ final class AudioHost: ObservableObject {
     @Published private(set) var isImporting = false
     private let engine = AVAudioEngine()
     private var unit: AVAudioUnit?
-    private var pendingTimbre: (name: String, values: [Float], envelope: [Float])?
+    private var pendingTimbre: (name: String, values: [Float], envelope: [Float], movement: TimbreMovement?)?
 
     private static let projectRootKey = "projectRoot"
     private static let checkpointKey = "checkpointPath"
@@ -82,7 +82,8 @@ final class AudioHost: ObservableObject {
             NSLog("SynthRL audio running at %f Hz", rate)
             if let pending = pendingTimbre {
                 pendingTimbre = nil
-                apply(timbre: pending.values, envelope: pending.envelope, name: pending.name)
+                apply(timbre: pending.values, envelope: pending.envelope,
+                      movement: pending.movement, name: pending.name)
             }
         } catch {
             let e = error as NSError
@@ -189,16 +190,18 @@ final class AudioHost: ObservableObject {
                               userInfo: [NSLocalizedDescriptionKey: "not a synth-timbre file"])
             }
             // Version 2 files carry a loudness envelope; version 1 files do not.
+            // Version 3 files may carry the source's movement instead (it replaces the envelope).
             let envelope = (doc["envelope"] as? [Double] ?? []).map { Float($0) }
+            let movement = Self.parseMovement(doc)
             let harmonics = values.map { Float($0) }
             // Audio may still be starting (the unit is created asynchronously).
             // Keep the timbre and apply it as soon as audio is running.
             guard unit != nil else {
-                pendingTimbre = (name, harmonics, envelope)
+                pendingTimbre = (name, harmonics, envelope, movement)
                 model.status = "TIMBRE · waiting for audio: \(name)"
                 return
             }
-            apply(timbre: harmonics, envelope: envelope, name: name)
+            apply(timbre: harmonics, envelope: envelope, movement: movement, name: name)
         } catch {
             model.status = "TIMBRE ERROR · \(error.localizedDescription)"
         }
@@ -280,22 +283,41 @@ final class AudioHost: ObservableObject {
         }
     }
 
+    /// The movement block of a version 3 timbre file (step 2c), or nil when it has none.
+    private static func parseMovement(_ doc: [String: Any]) -> TimbreMovement? {
+        guard let block = doc["movement"] as? [String: Any],
+              let start = block["loop_start"] as? Int,
+              let end = block["loop_end"] as? Int,
+              let amp = block["amp"] as? [Double],
+              let pitch = block["pitch_cents"] as? [Double],
+              let bright = block["brightness_oct"] as? [Double] else { return nil }
+        return TimbreMovement(loopStart: start, loopEnd: end,
+                              amp: amp.map { Float($0) },
+                              pitchCents: pitch.map { Float($0) },
+                              brightnessOct: bright.map { Float($0) })
+    }
+
     /// Pushes a timbre into the running unit and makes it audible.
-    private func apply(timbre: [Float], envelope: [Float], name: String) {
+    private func apply(timbre: [Float], envelope: [Float], movement: TimbreMovement?, name: String) {
         guard let au = unit?.auAudioUnit else {
             model.status = "TIMBRE ERROR · audio is not running"
             return
         }
         // Go through AUAudioUnit's full state rather than casting to SynthAudioUnit:
         // the unit's class comes from the bundled extension, not from this app.
-        // An envelope key left over from an earlier timbre must not survive a
-        // version 1 file, so it is removed when this file has no envelope.
+        // An envelope or movement key left over from an earlier timbre must not
+        // survive, so each is removed when this file does not have it.
         var state = au.fullState ?? [:]
         state[synthTimbreStateKey] = timbre.map { Double($0) }
         if envelope.isEmpty {
             state.removeValue(forKey: synthTimbreEnvelopeStateKey)
         } else {
             state[synthTimbreEnvelopeStateKey] = envelope.map { Double($0) }
+        }
+        if let movement {
+            state[synthTimbreMovementStateKey] = movement.stateValue
+        } else {
+            state.removeValue(forKey: synthTimbreMovementStateKey)
         }
         au.fullState = state
         let source = Int(SYNTH_PARAM_SOURCE_MIX)
