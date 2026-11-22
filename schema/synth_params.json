@@ -24,6 +24,10 @@
     {"index": 20, "id": "drive", "name": "Drive", "type": "continuous", "min": 0, "max": 1, "default": 0},
     {"index": 21, "id": "reverb_mix", "name": "Reverb Mix", "type": "continuous", "min": 0, "max": 1, "default": 0},
     {"index": 22, "id": "reverb_size", "name": "Reverb Size", "type": "continuous", "min": 0, "max": 1, "default": 0.5},
-    {"index": 23, "id": "source_mix", "name": "Source Mix", "type": "continuous", "min": 0, "max": 1, "default": 0}
+    {"index": 23, "id": "source_mix", "name": "Source Mix", "type": "continuous", "min": 0, "max": 1, "default": 0},
+    {"index": 24, "id": "movement", "name": "Movement", "type": "continuous", "min": 0, "max": 1, "default": 1},
+    {"index": 25, "id": "filter_mode", "name": "Filter Mode", "type": "continuous", "min": 0, "max": 1, "default": 0},
+    {"index": 26, "id": "spectral_amount", "name": "Spectral Amount", "type": "continuous", "min": 0, "max": 1, "default": 0},
+    {"index": 27, "id": "spectral_time", "name": "Spectral Time", "type": "continuous", "min": 0, "max": 1, "default": 0.5}
   ]
 }

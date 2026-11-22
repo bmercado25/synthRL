@@ -20,7 +20,8 @@ HARMONICS = 64  # must match SYNTH_TIMBRE_MAX_HARMONICS in core/synth_core.h
 N_FFT = 8192
 HOP = 2048
 FMIN = 40.0
-FMAX = 2000.0
+FMAX = 4000.0  # was 2000: pYIN halved notes above 2 kHz (labelled NSynth vocal at MIDI 102)
+ATTACK_WINDOW_S = 0.1  # the attack spectrum is measured over the first 100 ms
 SUSTAIN_THRESHOLD = 0.25  # keep frames whose RMS is at least this fraction of the peak
 PITCH_CONFIDENCE = 0.5  # pYIN probability a frame must reach to count as pitched
 MIN_PITCHED_FRACTION = 0.5  # reject the sample if fewer frames than this are pitched
@@ -31,6 +32,9 @@ class SourceAnalysis:
     sample_rate: int
     f0_hz: float
     harmonics: np.ndarray  # shape (HARMONICS,), peak-normalized, fundamental first
+    # Spectrum of the first ATTACK_WINDOW_S seconds, on the same scale as `harmonics`
+    # (divided by the sustain's raw peak). None when the clip is too short to tell.
+    attack_harmonics: np.ndarray | None = None
 
 
 def analyze(samples: np.ndarray, sample_rate: int) -> SourceAnalysis:
@@ -75,8 +79,24 @@ def analyze(samples: np.ndarray, sample_rate: int) -> SourceAnalysis:
     peak = amps.max()
     if peak <= 0.0:
         raise ValueError("no harmonic energy found")
+
+    attack_harmonics = None
+    early = np.arange(frames) * HOP / sample_rate < ATTACK_WINDOW_S
+    if early.any():
+        early_mag = spectrum[:, early].mean(axis=1)
+        attack_amps = np.zeros(HARMONICS, dtype=np.float64)
+        for k in range(1, HARMONICS + 1):
+            centre = k * f0_hz
+            if centre >= nyquist_limit:
+                break
+            window = (freqs >= centre - half_window) & (freqs <= centre + half_window)
+            if window.any():
+                attack_amps[k - 1] = early_mag[window].max()
+        attack_harmonics = (attack_amps / peak).astype(np.float32)
+
     return SourceAnalysis(sample_rate=sample_rate, f0_hz=f0_hz,
-                          harmonics=(amps / peak).astype(np.float32))
+                          harmonics=(amps / peak).astype(np.float32),
+                          attack_harmonics=attack_harmonics)
 
 
 def analyze_file(path: str) -> SourceAnalysis:

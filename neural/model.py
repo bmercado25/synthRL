@@ -193,10 +193,17 @@ def fit_to_note(wave_16k):
         raise ValueError("signal is silent")
     if x.size <= n:
         return np.pad(x, (0, n - x.size))
-    hop = SR // 4
+    return loudest_window(x, n, hop=SR // 4)
+
+
+def loudest_window(x, n, hop):
+    """The n-sample window of `x` with the most energy, scanned every `hop` samples.
+
+    `x` must be longer than n. The final window is always considered too.
+    """
     starts = list(range(0, x.size - n + 1, hop))
     if starts[-1] != x.size - n:
-        starts.append(x.size - n)  # always consider the final window too
+        starts.append(x.size - n)
     energy = [float(np.mean(x[s:s + n] ** 2)) for s in starts]
     best = starts[int(np.argmax(energy))]
     return x[best:best + n]
